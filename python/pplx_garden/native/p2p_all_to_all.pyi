@@ -32,8 +32,8 @@ class AllToAllContext:
         dp_size: int,
         node_size: int,
         world_size: int,
-        num_routed_ptr: int,
-        num_routed_mr: MemoryRegionHandle,
+        num_routed_ptrs: list[int],
+        num_routed_mrs: list[MemoryRegionHandle],
         send_buffer_ptr: int,
         send_buffer_mr: MemoryRegionHandle,
         recv_buffer_ptr: int,
@@ -46,7 +46,7 @@ class AllToAllContext:
         ranks: list[
             tuple[
                 DomainAddress,
-                MemoryRegionDescriptor,
+                list[MemoryRegionDescriptor],
                 MemoryRegionDescriptor,
             ]
         ],
@@ -56,7 +56,6 @@ class AllToAllContext:
     ) -> None: ...
     def dispatch_send(
         self,
-        slot: int,
         num_tokens: int,
         x_ptr: int,
         x_stride: int,
@@ -69,7 +68,7 @@ class AllToAllContext:
         weights_stride: int,
         bound_m_ptr: int | None,
         stream: int,
-    ) -> None: ...
+    ) -> int: ...
     def dispatch_recv(
         self,
         slot: int,

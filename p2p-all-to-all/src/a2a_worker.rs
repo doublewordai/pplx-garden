@@ -1,7 +1,8 @@
 use std::{
+    collections::VecDeque,
     ffi::c_void,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -51,6 +52,38 @@ pub(crate) struct WorkerBuffers {
 
 unsafe impl Send for WorkerBuffers {}
 unsafe impl Sync for WorkerBuffers {}
+
+pub(crate) struct SlotPool {
+    free_slots: Mutex<VecDeque<usize>>,
+    condvar: Condvar,
+}
+
+impl SlotPool {
+    pub(crate) fn new(num_slots: usize) -> Self {
+        Self {
+            free_slots: Mutex::new((0..num_slots).collect()),
+            condvar: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn acquire(&self) -> usize {
+        let mut free_slots = self.free_slots.lock().unwrap();
+        loop {
+            if let Some(slot) = free_slots.pop_front() {
+                return slot;
+            }
+            free_slots = self.condvar.wait(free_slots).unwrap();
+        }
+    }
+
+    pub(crate) fn release(&self, slot: usize) {
+        let mut free_slots = self.free_slots.lock().unwrap();
+        if !free_slots.contains(&slot) {
+            free_slots.push_back(slot);
+            self.condvar.notify_one();
+        }
+    }
+}
 
 #[allow(dead_code)]
 pub(crate) struct MicrobatchSlot {
@@ -125,6 +158,8 @@ impl MicrobatchSlot {
 }
 
 pub(crate) struct WorkerState {
+    slot_idx: usize,
+    slot_pool: Arc<SlotPool>,
     transfer_engine: Arc<TransferEngine>,
     max_num_tokens: usize,
     max_recv_tokens: usize,
@@ -188,6 +223,8 @@ struct RoutingInfo {
 impl WorkerState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        slot_idx: usize,
+        slot_pool: Arc<SlotPool>,
         hidden_dim: usize,
         hidden_dim_scale: usize,
         in_elemsize: usize,
@@ -300,6 +337,8 @@ impl WorkerState {
         };
 
         Ok(WorkerState {
+            slot_idx,
+            slot_pool,
             transfer_engine: transfer_engine.clone(),
             max_num_tokens,
             max_recv_tokens,
@@ -527,6 +566,7 @@ impl WorkerState {
         ) {
             return;
         }
+        self.slot_pool.release(self.slot_idx);
     }
 
     fn dispatch_initial_routes(&self) -> usize {

@@ -41,8 +41,8 @@ impl PyAllToAllContext {
         dp_size: usize,
         node_size: usize,
         world_size: usize,
-        num_routed_ptr: u64,
-        num_routed_mr: PyMemoryRegionHandle,
+        num_routed_ptrs: Vec<u64>,
+        num_routed_mrs: Vec<PyMemoryRegionHandle>,
         send_buffer_ptr: u64,
         send_buffer_mr: PyMemoryRegionHandle,
         recv_buffer_ptr: u64,
@@ -54,17 +54,30 @@ impl PyAllToAllContext {
         imm_base: u32,
         ranks: Vec<(
             PyDomainAddress,
-            PyMemoryRegionDescriptor,
+            Vec<PyMemoryRegionDescriptor>,
             PyMemoryRegionDescriptor,
         )>,
         transfer_engine: &PyTransferEngine,
         worker_cpu: Option<u16>,
         num_slots: usize,
     ) -> PyResult<Self> {
-        let rank_handles = ranks
-            .into_iter()
-            .map(|data| AllToAllRankHandle::new(data.0.0, data.1.0, data.2.0))
-            .collect();
+        let mut rank_handles = vec![Vec::with_capacity(ranks.len()); num_slots.max(1)];
+        for (address, num_routed_descs, recv_buffer_desc) in ranks {
+            if num_routed_descs.len() != rank_handles.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Expected {} num_routed descriptors, got {}",
+                    rank_handles.len(),
+                    num_routed_descs.len()
+                )));
+            }
+            for (slot, num_routed_desc) in num_routed_descs.into_iter().enumerate() {
+                rank_handles[slot].push(AllToAllRankHandle::new(
+                    address.0.clone(),
+                    num_routed_desc.0,
+                    recv_buffer_desc.0.clone(),
+                ));
+            }
+        }
 
         let ctx = AllToAllContext::new(
             hidden_dim,
@@ -84,8 +97,8 @@ impl PyAllToAllContext {
             dp_size,
             node_size,
             world_size,
-            num_routed_ptr as *mut u32,
-            num_routed_mr.0,
+            num_routed_ptrs.into_iter().map(|ptr| ptr as *mut u32).collect(),
+            num_routed_mrs.into_iter().map(|mr| mr.0).collect(),
             send_buffer_ptr as *mut c_void,
             send_buffer_mr.0,
             recv_buffer_ptr as *mut c_void,
@@ -106,7 +119,6 @@ impl PyAllToAllContext {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_send(
         &mut self,
-        slot: usize,
         num_tokens: usize,
         x_ptr: u64,
         x_stride: usize,
@@ -119,10 +131,9 @@ impl PyAllToAllContext {
         weights_stride: usize,
         bound_m_ptr: Option<u64>,
         stream: u64,
-    ) -> PyResult<()> {
+    ) -> PyResult<usize> {
         self.ctx
             .dispatch_send(
-                slot,
                 num_tokens,
                 x_ptr as *const c_void,
                 x_stride,

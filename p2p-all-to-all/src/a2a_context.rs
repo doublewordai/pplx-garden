@@ -15,7 +15,10 @@ use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
 use thread_lib::pin_cpu;
 use torch_lib::ScalarType;
 
-use crate::{a2a_handles::AllToAllRankHandle, a2a_worker::WorkerState};
+use crate::{
+    a2a_handles::AllToAllRankHandle,
+    a2a_worker::{SlotPool, WorkerState},
+};
 
 // Collects the private workspace buffers used by dispatch and combine.
 struct DeviceWorkspace {
@@ -122,6 +125,7 @@ pub struct AllToAllContext {
     workspaces: Vec<DeviceWorkspace>,
     workers: Vec<Arc<WorkerState>>,
     threads: Vec<JoinHandle<()>>,
+    slot_pool: Arc<SlotPool>,
     num_blocks: usize,
 }
 
@@ -145,8 +149,8 @@ impl AllToAllContext {
         dp_size: usize,
         node_size: usize,
         world_size: usize,
-        num_routed_ptr: *mut u32,
-        num_routed_mr: MemoryRegionHandle,
+        num_routed_ptrs: Vec<*mut u32>,
+        num_routed_mrs: Vec<MemoryRegionHandle>,
         send_buffer_ptr: *mut c_void,
         send_buffer_mr: MemoryRegionHandle,
         recv_buffer_ptr: *mut c_void,
@@ -156,20 +160,36 @@ impl AllToAllContext {
         recv_ptrs: Vec<u64>,
         device: u8,
         imm_base: u32,
-        rank_handles: Vec<AllToAllRankHandle>,
+        rank_handles: Vec<Vec<AllToAllRankHandle>>,
         transfer_engine: Arc<TransferEngine>,
         worker_cpu: Option<u16>,
         num_slots: usize,
     ) -> Result<Self> {
         // Start the all-to-all worker thread.
-        for (i, peer) in rank_handles.iter().enumerate() {
+        for (i, peer) in rank_handles.first().into_iter().flatten().enumerate() {
             tracing::info!("Rank#{} Peer#{}: {}", rank, i, peer.address);
         }
 
         let num_slots = num_slots.max(1);
+        if num_routed_ptrs.len() != num_slots || num_routed_mrs.len() != num_slots {
+            return Err(anyhow!(
+                "Expected {} num_routed buffers, got {} ptrs and {} MRs",
+                num_slots,
+                num_routed_ptrs.len(),
+                num_routed_mrs.len()
+            ));
+        }
+        if rank_handles.len() != num_slots {
+            return Err(anyhow!(
+                "Expected {} rank handle sets, got {}",
+                num_slots,
+                rank_handles.len()
+            ));
+        }
         let tx_ready_context = GdrCopyContext::new()?;
         let tx_ready = Arc::new(GdrFlag::new(&tx_ready_context)?);
         tx_ready.set(true);
+        let slot_pool = Arc::new(SlotPool::new(num_slots));
 
         let mut workers = Vec::with_capacity(num_slots);
         let mut threads = Vec::with_capacity(num_slots);
@@ -178,6 +198,8 @@ impl AllToAllContext {
         for slot_idx in 0..num_slots {
             let slot_imm_base = imm_base + (slot_idx as u32) * 5;
             let worker: Arc<WorkerState> = Arc::new(WorkerState::new(
+                slot_idx,
+                slot_pool.clone(),
                 hidden_dim,
                 hidden_dim_scale,
                 in_elemsize,
@@ -194,15 +216,15 @@ impl AllToAllContext {
                 dp_size,
                 node_size,
                 world_size,
-                num_routed_ptr,
-                num_routed_mr,
+                num_routed_ptrs[slot_idx],
+                num_routed_mrs[slot_idx],
                 send_buffer_ptr,
                 send_buffer_mr,
                 recv_buffer_ptr,
                 recv_buffer_mr,
                 device,
                 slot_imm_base,
-                rank_handles.clone(),
+                rank_handles[slot_idx].clone(),
                 transfer_engine.clone(),
                 tx_ready.clone(),
             )?);
@@ -289,6 +311,7 @@ impl AllToAllContext {
             workspaces,
             workers,
             threads,
+            slot_pool,
             num_blocks,
         })
     }
@@ -323,7 +346,6 @@ impl AllToAllContext {
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_send(
         &mut self,
-        slot: usize,
         num_tokens: usize,
         x_ptr: *const c_void,
         x_stride: usize,
@@ -336,10 +358,11 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
+        let slot = self.slot_pool.acquire();
         let num_blocks = self.num_blocks;
         let hidden_dim = self.hidden_dim;
         let hidden_dim_scale = self.hidden_dim_scale;
@@ -396,7 +419,7 @@ impl AllToAllContext {
         if worker.failed() {
             return Err(anyhow!("fabric-lib transfer error"));
         }
-        Ok(())
+        Ok(slot)
     }
 
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
