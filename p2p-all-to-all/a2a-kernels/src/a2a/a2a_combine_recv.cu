@@ -26,6 +26,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     size_t rank,
     size_t world_size,
     size_t num_tokens,
+    size_t num_recv_tokens,
+    size_t max_recv_tokens,
     const int32_t *bound_m_ptr,
     const int32_t *indices_ptr,
     const size_t indices_stride,
@@ -38,15 +40,17 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     uint32_t *token_offset,
     uint32_t *expert_offsets,
     uint8_t *combine_recv_flag,
-    uint8_t *combine_recv_done,
+    uint32_t *combine_recv_done,
     uint32_t *sync_counter,
-    uint32_t **sync_ptrs
+    uint32_t **sync_ptrs,
+    uint32_t * __restrict__ current_epoch
 ) {
     extern __shared__ std::byte shared_memory[];
 
     auto grid = cooperative_groups::this_grid();
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
 
     // Determine the number of tokens to combine on the current rank.
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
@@ -152,7 +156,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (blockIdx.x == 0) {
         if (warp_id == 0) {
             if (elect_one_sync()) {
-                st_mmio_b8(combine_recv_done, 1);
+                st_mmio_u32(combine_recv_done, epoch);
                 *combine_recv_flag = 0;
                 *sync_counter = counter + 1;
             }
@@ -179,6 +183,8 @@ int a2a_kernels::a2a_combine_recv(
     size_t node_size,
     size_t world_size,
     size_t num_tokens,
+    size_t num_recv_tokens,
+    size_t max_recv_tokens,
     const int32_t *bound_m_ptr,
     const int32_t *indices_ptr,
     size_t indices_stride,
@@ -191,9 +197,10 @@ int a2a_kernels::a2a_combine_recv(
     uint32_t *token_offset,
     uint32_t *expert_offsets,
     uint8_t *combine_recv_flag,
-    uint8_t *combine_recv_done,
+    uint32_t *combine_recv_done,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
@@ -207,6 +214,8 @@ int a2a_kernels::a2a_combine_recv(
         &rank,
         &world_size,
         &num_tokens,
+        &num_recv_tokens,
+        &max_recv_tokens,
         &bound_m_ptr,
         &indices_ptr,
         &indices_stride,
@@ -222,6 +231,7 @@ int a2a_kernels::a2a_combine_recv(
         &combine_recv_done,
         &sync_counter,
         &sync_ptrs,
+        &current_epoch,
     };
 
     constexpr size_t NUM_WARPS = 16;

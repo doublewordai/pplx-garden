@@ -43,10 +43,10 @@ impl PyAllToAllContext {
         world_size: usize,
         num_routed_ptrs: Vec<u64>,
         num_routed_mrs: Vec<PyMemoryRegionHandle>,
-        send_buffer_ptr: u64,
-        send_buffer_mr: PyMemoryRegionHandle,
-        recv_buffer_ptr: u64,
-        recv_buffer_mr: PyMemoryRegionHandle,
+        send_buffer_ptrs: Vec<u64>,
+        send_buffer_mrs: Vec<PyMemoryRegionHandle>,
+        recv_buffer_ptrs: Vec<u64>,
+        recv_buffer_mrs: Vec<PyMemoryRegionHandle>,
         sync_ptrs: Vec<u64>,
         send_ptrs: Vec<u64>,
         recv_ptrs: Vec<u64>,
@@ -55,14 +55,14 @@ impl PyAllToAllContext {
         ranks: Vec<(
             PyDomainAddress,
             Vec<PyMemoryRegionDescriptor>,
-            PyMemoryRegionDescriptor,
+            Vec<PyMemoryRegionDescriptor>,
         )>,
         transfer_engine: &PyTransferEngine,
         worker_cpu: Option<u16>,
         num_slots: usize,
     ) -> PyResult<Self> {
         let mut rank_handles = vec![Vec::with_capacity(ranks.len()); num_slots.max(1)];
-        for (address, num_routed_descs, recv_buffer_desc) in ranks {
+        for (address, num_routed_descs, recv_buffer_descs) in ranks {
             if num_routed_descs.len() != rank_handles.len() {
                 return Err(PyRuntimeError::new_err(format!(
                     "Expected {} num_routed descriptors, got {}",
@@ -70,11 +70,22 @@ impl PyAllToAllContext {
                     num_routed_descs.len()
                 )));
             }
-            for (slot, num_routed_desc) in num_routed_descs.into_iter().enumerate() {
+            if recv_buffer_descs.len() != rank_handles.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Expected {} recv buffer descriptors, got {}",
+                    rank_handles.len(),
+                    recv_buffer_descs.len()
+                )));
+            }
+            for (slot, (num_routed_desc, recv_buffer_desc)) in num_routed_descs
+                .into_iter()
+                .zip(recv_buffer_descs.into_iter())
+                .enumerate()
+            {
                 rank_handles[slot].push(AllToAllRankHandle::new(
                     address.0.clone(),
                     num_routed_desc.0,
-                    recv_buffer_desc.0.clone(),
+                    recv_buffer_desc.0,
                 ));
             }
         }
@@ -99,10 +110,16 @@ impl PyAllToAllContext {
             world_size,
             num_routed_ptrs.into_iter().map(|ptr| ptr as *mut u32).collect(),
             num_routed_mrs.into_iter().map(|mr| mr.0).collect(),
-            send_buffer_ptr as *mut c_void,
-            send_buffer_mr.0,
-            recv_buffer_ptr as *mut c_void,
-            recv_buffer_mr.0,
+            send_buffer_ptrs
+                .into_iter()
+                .map(|ptr| ptr as *mut c_void)
+                .collect(),
+            send_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
+            recv_buffer_ptrs
+                .into_iter()
+                .map(|ptr| ptr as *mut c_void)
+                .collect(),
+            recv_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
             sync_ptrs,
             send_ptrs,
             recv_ptrs,
@@ -134,6 +151,42 @@ impl PyAllToAllContext {
     ) -> PyResult<usize> {
         self.ctx
             .dispatch_send(
+                num_tokens,
+                x_ptr as *const c_void,
+                x_stride,
+                x_scale_ptr.map(|ptr| ptr as *const c_void).unwrap_or(null()),
+                x_scale_stride_elem.unwrap_or(0),
+                x_scale_stride_token.unwrap_or(0),
+                indices_ptr as *const i32,
+                indices_stride,
+                weights_ptr as *const f32,
+                weights_stride,
+                bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
+                stream,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_send_on_slot(
+        &mut self,
+        slot: usize,
+        num_tokens: usize,
+        x_ptr: u64,
+        x_stride: usize,
+        x_scale_ptr: Option<u64>,
+        x_scale_stride_elem: Option<usize>,
+        x_scale_stride_token: Option<usize>,
+        indices_ptr: u64,
+        indices_stride: usize,
+        weights_ptr: u64,
+        weights_stride: usize,
+        bound_m_ptr: Option<u64>,
+        stream: u64,
+    ) -> PyResult<usize> {
+        self.ctx
+            .dispatch_send_on_slot(
+                slot,
                 num_tokens,
                 x_ptr as *const c_void,
                 x_stride,

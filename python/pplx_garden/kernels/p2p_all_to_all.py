@@ -1,4 +1,6 @@
+import os
 import pickle
+import weakref
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -27,12 +29,19 @@ logger = logging_utils.get_logger(__name__)
 
 _PAGE_SIZE = 4096
 
+_CUDA_GRAPH_KERNELS: weakref.WeakSet["P2PAllToAll"] = weakref.WeakSet()
+
+
+def reset_all_cuda_graph_capture_slots() -> None:
+    for kernel in list(_CUDA_GRAPH_KERNELS):
+        kernel.reset_cuda_graph_capture_slots()
+
 
 @dataclass
 class _RdmaRankData:
     address: bytes
     num_routed_descs: list[bytes]
-    recv_buffer_desc: bytes
+    recv_buffer_descs: list[bytes]
 
 
 @dataclass
@@ -62,6 +71,7 @@ class P2PDispatchHandle:
     bound_m: Optional[torch.Tensor]
     send_done_event: torch.cuda.Event
     _slot: int
+    recv_done_event: Optional[torch.cuda.Event] = None
     recv_done: bool = False
 
     def recv(self) -> None:
@@ -81,7 +91,16 @@ class P2PDispatchHandle:
             do_send=False,
             do_recv=True,
         )
+        self.recv_done_event = torch.cuda.Event()
+        self.recv_done_event.record(torch.cuda.current_stream(self.dp_x.device))
         self.recv_done = True
+
+    def wait_recv_done(self) -> None:
+        self.recv()
+        assert self.recv_done_event is not None
+        torch.cuda.current_stream(self.dp_x.device).wait_event(
+            self.recv_done_event
+        )
 
 
 @dataclass
@@ -94,6 +113,7 @@ class P2PCombineHandle:
     accumulate: bool
     send_done_event: torch.cuda.Event
     _slot: int
+    recv_done_event: Optional[torch.cuda.Event] = None
     recv_done: bool = False
 
     def recv(self) -> None:
@@ -113,7 +133,16 @@ class P2PCombineHandle:
             do_recv=True,
             accumulate=self.accumulate,
         )
+        self.recv_done_event = torch.cuda.Event()
+        self.recv_done_event.record(torch.cuda.current_stream(self.out_tokens.device))
         self.recv_done = True
+
+    def wait_recv_done(self) -> None:
+        self.recv()
+        assert self.recv_done_event is not None
+        torch.cuda.current_stream(self.out_tokens.device).wait_event(
+            self.recv_done_event
+        )
 
 
 class P2PAllToAll(AllToAllKernel):
@@ -150,8 +179,12 @@ class P2PAllToAll(AllToAllKernel):
         self._global_group = global_group
         self._max_tokens_per_expert = max_tokens_per_expert
         self._handle_kind = CUMemHandleKind.FileDescriptor
-        self._num_slots = 2
+        self._num_slots = int(os.environ.get("PPLX_GARDEN_NUM_SLOTS", "2"))
+        if self._num_slots < 1:
+            raise ValueError("PPLX_GARDEN_NUM_SLOTS must be >= 1")
+        self._capture_free_slots = list(range(self._num_slots))
         self._sync_slot: Optional[int] = None
+        _CUDA_GRAPH_KERNELS.add(self)
 
         # Determine the number of local experts.
         self._node_group: Optional[ParallelGroup]
@@ -277,31 +310,35 @@ class P2PAllToAll(AllToAllKernel):
         send_buffer_bytes = round_up(max_recv_tokens * token_dim, _PAGE_SIZE)
         recv_buffer_bytes = round_up(max_recv_tokens * token_dim, _PAGE_SIZE)
 
-        self._send_buffer_handle = CUMemAllocHandle(
-            send_buffer_bytes,
-            self._device,
-            self._handle_kind,
-        )
-        self._send_buffer_mapping = self._send_buffer_handle.map(self._device)
-        send_buffer_mr, _send_buffer_desc = self._transfer_engine.register_tensor(
-            self._send_buffer_mapping.to_tensor(
-                (send_buffer_bytes,),
-                torch.uint8,
+        self._send_buffer_handles = [
+            CUMemAllocHandle(send_buffer_bytes, self._device, self._handle_kind)
+            for _ in range(num_slots)
+        ]
+        self._send_buffer_mappings = [
+            handle.map(self._device) for handle in self._send_buffer_handles
+        ]
+        send_buffer_mrs: list[MemoryRegionHandle] = []
+        for mapping in self._send_buffer_mappings:
+            send_buffer_mr, _send_buffer_desc = self._transfer_engine.register_tensor(
+                mapping.to_tensor((send_buffer_bytes,), torch.uint8)
             )
-        )
+            send_buffer_mrs.append(send_buffer_mr)
 
-        self._recv_buffer_handle = CUMemAllocHandle(
-            recv_buffer_bytes,
-            self._device,
-            self._handle_kind,
-        )
-        self._recv_buffer_mapping = self._recv_buffer_handle.map(self._device)
-        recv_buffer_mr, recv_buffer_desc = self._transfer_engine.register_tensor(
-            self._recv_buffer_mapping.to_tensor(
-                (recv_buffer_bytes,),
-                torch.uint8,
+        self._recv_buffer_handles = [
+            CUMemAllocHandle(recv_buffer_bytes, self._device, self._handle_kind)
+            for _ in range(num_slots)
+        ]
+        self._recv_buffer_mappings = [
+            handle.map(self._device) for handle in self._recv_buffer_handles
+        ]
+        recv_buffer_mrs: list[MemoryRegionHandle] = []
+        recv_buffer_descs: list[MemoryRegionDescriptor] = []
+        for mapping in self._recv_buffer_mappings:
+            recv_buffer_mr, recv_buffer_desc = self._transfer_engine.register_tensor(
+                mapping.to_tensor((recv_buffer_bytes,), torch.uint8)
             )
-        )
+            recv_buffer_mrs.append(recv_buffer_mr)
+            recv_buffer_descs.append(recv_buffer_desc)
 
         # Exchange NVLink buffers.
         self._nvl_mappings: list[_NVLRankMapping] = []
@@ -327,8 +364,8 @@ class P2PAllToAll(AllToAllKernel):
 
             local_handle = _NVLRankData(
                 sync_fd=self._sync_buffer_handle.export(),
-                send_fd=self._send_buffer_handle.export(),
-                recv_fd=self._recv_buffer_handle.export(),
+                send_fd=self._send_buffer_handles[0].export(),
+                recv_fd=self._recv_buffer_handles[0].export(),
             )
             handles = self._node_group.all_gather_object(pickle.dumps(local_handle))
 
@@ -337,8 +374,8 @@ class P2PAllToAll(AllToAllKernel):
                     self._nvl_mappings.append(
                         _NVLRankMapping(
                             sync_mapping=sync_mapping,
-                            send_mapping=self._send_buffer_mapping,
-                            recv_mapping=self._recv_buffer_mapping,
+                            send_mapping=self._send_buffer_mappings[0],
+                            recv_mapping=self._recv_buffer_mappings[0],
                         )
                     )
                 else:
@@ -371,7 +408,7 @@ class P2PAllToAll(AllToAllKernel):
             _RdmaRankData(
                 address=self._transfer_engine.main_address.as_bytes(),
                 num_routed_descs=[desc.as_bytes() for desc in num_routed_descs],
-                recv_buffer_desc=recv_buffer_desc.as_bytes(),
+                recv_buffer_descs=[desc.as_bytes() for desc in recv_buffer_descs],
             )
         )
         ranks = [
@@ -381,7 +418,10 @@ class P2PAllToAll(AllToAllKernel):
                     MemoryRegionDescriptor.from_bytes(desc)
                     for desc in data.num_routed_descs
                 ],
-                MemoryRegionDescriptor.from_bytes(data.recv_buffer_desc),
+                [
+                    MemoryRegionDescriptor.from_bytes(desc)
+                    for desc in data.recv_buffer_descs
+                ],
             )
             for data in gathered_rank_data
         ]
@@ -407,10 +447,10 @@ class P2PAllToAll(AllToAllKernel):
             world_size=world_size,
             num_routed_ptrs=[buf.data_ptr() for buf in self._num_routed_buffers],
             num_routed_mrs=num_routed_mrs,
-            send_buffer_ptr=self._send_buffer_mapping.data_ptr(),
-            send_buffer_mr=send_buffer_mr,
-            recv_buffer_ptr=self._recv_buffer_mapping.data_ptr(),
-            recv_buffer_mr=recv_buffer_mr,
+            send_buffer_ptrs=[m.data_ptr() for m in self._send_buffer_mappings],
+            send_buffer_mrs=send_buffer_mrs,
+            recv_buffer_ptrs=[m.data_ptr() for m in self._recv_buffer_mappings],
+            recv_buffer_mrs=recv_buffer_mrs,
             sync_ptrs=sync_ptrs,
             send_ptrs=send_ptrs,
             recv_ptrs=recv_ptrs,
@@ -424,6 +464,22 @@ class P2PAllToAll(AllToAllKernel):
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()
+
+    def reset_cuda_graph_capture_slots(self) -> None:
+        self._capture_free_slots = list(range(self._num_slots))
+
+    def _acquire_cuda_graph_capture_slot(self) -> int:
+        if not self._capture_free_slots:
+            raise RuntimeError(
+                "PPLX Garden CUDA graph capture needs more slots. "
+                "A dispatch was captured before an earlier combine released "
+                f"one of the {self._num_slots} slots."
+            )
+        return self._capture_free_slots.pop(0)
+
+    def _release_cuda_graph_capture_slot(self, slot: int) -> None:
+        if slot not in self._capture_free_slots:
+            self._capture_free_slots.append(slot)
 
     @override
     def dispatch(
@@ -536,20 +592,45 @@ class P2PAllToAll(AllToAllKernel):
         stream = torch.cuda.current_stream().cuda_stream
 
         if do_send:
-            _slot = all_to_all.dispatch_send(
-                num_tokens=num_tokens,
-                x_ptr=x_ptr,
-                x_stride=x_stride * self._in_dtype.itemsize,
-                x_scale_ptr=x_scale_ptr,
-                x_scale_stride_elem=x_scale_stride_elem,
-                x_scale_stride_token=x_scale_stride_token,
-                indices_ptr=indices_ptr,
-                indices_stride=indices_stride,
-                weights_ptr=weights_ptr,
-                weights_stride=weights_stride,
-                bound_m_ptr=bound_m_ptr,
-                stream=stream,
-            )
+            if _slot is None and torch.cuda.is_current_stream_capturing():
+                _slot = self._acquire_cuda_graph_capture_slot()
+                logger.info(
+                    "PPLX CUDA graph dispatch capture slot=%s num_tokens=%s",
+                    _slot,
+                    num_tokens,
+                )
+
+            if _slot is None:
+                _slot = all_to_all.dispatch_send(
+                    num_tokens=num_tokens,
+                    x_ptr=x_ptr,
+                    x_stride=x_stride * self._in_dtype.itemsize,
+                    x_scale_ptr=x_scale_ptr,
+                    x_scale_stride_elem=x_scale_stride_elem,
+                    x_scale_stride_token=x_scale_stride_token,
+                    indices_ptr=indices_ptr,
+                    indices_stride=indices_stride,
+                    weights_ptr=weights_ptr,
+                    weights_stride=weights_stride,
+                    bound_m_ptr=bound_m_ptr,
+                    stream=stream,
+                )
+            else:
+                all_to_all.dispatch_send_on_slot(
+                    slot=_slot,
+                    num_tokens=num_tokens,
+                    x_ptr=x_ptr,
+                    x_stride=x_stride * self._in_dtype.itemsize,
+                    x_scale_ptr=x_scale_ptr,
+                    x_scale_stride_elem=x_scale_stride_elem,
+                    x_scale_stride_token=x_scale_stride_token,
+                    indices_ptr=indices_ptr,
+                    indices_stride=indices_stride,
+                    weights_ptr=weights_ptr,
+                    weights_stride=weights_stride,
+                    bound_m_ptr=bound_m_ptr,
+                    stream=stream,
+                )
             self._sync_slot = _slot
 
         if _slot is None:
@@ -702,6 +783,37 @@ class P2PAllToAll(AllToAllKernel):
         assert _slot is not None
 
         if do_send:
+            if torch.cuda.is_current_stream_capturing():
+                logger.info(
+                    "PPLX CUDA graph combine send slot=%s num_tokens=%s "
+                    "num_recv_tokens=%s",
+                    _slot,
+                    num_tokens,
+                    num_recv_tokens,
+                )
+            if os.environ.get("PPLX_GARDEN_TRACE") == "1":
+                logger.warning(
+                    "PPLX combine send trace slot=%s capturing=%s "
+                    "stream=%s num_tokens=%s num_recv_tokens=%s "
+                    "expert_y_ptr=%#x expert_y_stride=%s "
+                    "expert_y_shape=%s expert_y_stride_elems=%s "
+                    "out_tokens_ptr=%#x out_tokens_shape=%s "
+                    "indices_ptr=%#x weights_ptr=%#x bound_m_ptr=%s",
+                    _slot,
+                    torch.cuda.is_current_stream_capturing(),
+                    stream,
+                    num_tokens,
+                    num_recv_tokens,
+                    expert_y_ptr,
+                    expert_y_stride,
+                    tuple(expert_y.shape),
+                    tuple(expert_y.stride()),
+                    out_tokens_ptr,
+                    tuple(out_tokens.shape),
+                    indices_ptr,
+                    weights_ptr,
+                    None if bound_m_ptr is None else hex(bound_m_ptr),
+                )
             all_to_all.combine_send(
                 slot=_slot,
                 expert_x_ptr=expert_y_ptr,
@@ -727,6 +839,8 @@ class P2PAllToAll(AllToAllKernel):
             )
             if self._sync_slot == _slot:
                 self._sync_slot = None
+            if torch.cuda.is_current_stream_capturing():
+                self._release_cuda_graph_capture_slot(_slot)
 
     def combine_async(
         self,
@@ -737,6 +851,7 @@ class P2PAllToAll(AllToAllKernel):
         bound_m: Optional[torch.Tensor] = None,
         accumulate: bool = False,
     ) -> P2PCombineHandle:
+        dispatch_handle.wait_recv_done()
         self.combine(
             out_tokens=out_tokens,
             indices=dispatch_handle.indices,

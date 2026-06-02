@@ -41,13 +41,14 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ padded_index,
     uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ num_recv_tokens_ptr,
-    uint8_t * __restrict__ num_recv_tokens_flag,
+    uint32_t * __restrict__ num_recv_tokens_ready,
     uint8_t * __restrict__ dispatch_recv_flag,
-    uint8_t * __restrict__ dispatch_recv_done,
+    uint32_t * __restrict__ dispatch_recv_done,
     uint32_t * __restrict__ grid_counter,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
-    std::byte **send_ptrs
+    std::byte **send_ptrs,
+    uint32_t * __restrict__ current_epoch
 ) {
     TokenDimTy token_dim_bound(token_dim);
     HiddenDimScaleTy hidden_dim_scale_bound(hidden_dim_scale);
@@ -84,6 +85,12 @@ void a2a_dispatch_recv_kernel(
     auto block = cooperative_groups::this_thread_block();
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *grid_counter = 0;
+    }
+    grid.sync();
 
     const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size / dp_size);
     const size_t first_expert = (rank / dp_size) * experts_per_rank;
@@ -93,7 +100,7 @@ void a2a_dispatch_recv_kernel(
     auto counter = *sync_counter;
     if (warp_id == 0) {
         if (elect_one_sync()) {
-            while (ld_mmio_b8(num_recv_tokens_flag) == 0);
+            while (ld_mmio_u32(num_recv_tokens_ready) != epoch);
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
@@ -224,15 +231,12 @@ void a2a_dispatch_recv_kernel(
         }
     }
 
-    if (threadIdx.x == 0) {
-        auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
-        if (counter == num_efa_tokens) {
-            st_mmio_b8(dispatch_recv_done, 1);
-            // Reset the state.
-            *num_recv_tokens_flag = 0;
-            *dispatch_recv_flag = 0;
-            *grid_counter = 0;
-        }
+    grid.sync();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        st_mmio_u32(dispatch_recv_done, epoch);
+        // Reset the state.
+        *dispatch_recv_flag = 0;
     }
 }
 
@@ -262,13 +266,14 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t *padded_index,
     uint32_t *num_routed,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *num_recv_tokens_flag,
+    uint32_t *num_recv_tokens_ready,
     uint8_t *dispatch_recv_flag,
-    uint8_t *dispatch_recv_done,
+    uint32_t *dispatch_recv_done,
     uint32_t *grid_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **send_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     constexpr size_t NUM_WARPS = 16;
@@ -307,13 +312,14 @@ int a2a_kernels::a2a_dispatch_recv(
         &padded_index,
         &num_routed,
         &num_recv_tokens_ptr,
-        &num_recv_tokens_flag,
+        &num_recv_tokens_ready,
         &dispatch_recv_flag,
         &dispatch_recv_done,
         &grid_counter,
         &sync_counter,
         &sync_ptrs,
         &send_ptrs,
+        &current_epoch,
     };
 
     nvtxRangePush("dispatch_recv");

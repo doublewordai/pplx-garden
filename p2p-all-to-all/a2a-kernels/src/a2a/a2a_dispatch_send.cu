@@ -139,14 +139,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     uint32_t * __restrict__ token_offset,
     uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ expert_offsets,
-    uint8_t * __restrict__ dispatch_route_done,
-    uint8_t * __restrict__ dispatch_send_done,
+    uint32_t * __restrict__ dispatch_route_done,
+    uint32_t * __restrict__ dispatch_send_done,
     uint8_t * __restrict__ tx_ready,
     std::byte * __restrict__ send_buffer,
     uint32_t * __restrict__ grid_counter,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
-    std::byte ** __restrict__ recv_ptrs
+    std::byte ** __restrict__ recv_ptrs,
+    uint32_t * __restrict__ epoch_counter,
+    uint32_t * __restrict__ current_epoch
 ) {
     TokenDimTy token_dim_bound(token_dim);
     HiddenDimScaleTy hidden_dim_scale_bound(hidden_dim_scale);
@@ -159,6 +161,12 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
     const size_t warp_id = threadIdx.x / WARP_SIZE;
     const size_t lane_id = get_lane_id();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *current_epoch = atomicAdd(epoch_counter, 1) + 1;
+    }
+    grid.sync();
+    const uint32_t epoch = *current_epoch;
 
     uint32_t counter = *sync_counter;
 
@@ -211,7 +219,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            st_mmio_b8(dispatch_route_done, 1);
+            st_mmio_u32(dispatch_route_done, epoch);
         }
         for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
             unsigned warp_sum_expert = __shfl_up_sync(0xFFFFFFFF, expert_offset, offset);
@@ -329,14 +337,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         }
                     }
                 }
-
-                if (threadIdx.x == 0) {
-                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
-                    if (counter == num_send_tokens) {
-                        st_mmio_b8(dispatch_send_done, 1);
-                        *grid_counter = 0;
-                    }
-                }
             } else {
                 constexpr size_t TOKEN_DIM = TokenDimTy::Value;
                 constexpr size_t NUM_STEPS = (TOKEN_DIM + NUM_THREADS - 1) / NUM_THREADS;
@@ -376,14 +376,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 }
 
                 __syncthreads();
-
-                if (threadIdx.x == 0) {
-                    auto counter = add_release_gpu_u32(grid_counter, 1) + 1;
-                    if (counter == num_send_tokens) {
-                        st_mmio_b8(dispatch_send_done, 1);
-                        *grid_counter = 0;
-                    }
-                }
 
                 grid.sync();
 
@@ -468,14 +460,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
         __syncthreads();
 
-        if (threadIdx.x == 0) {
-            auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
-            if (counter == num_send_tokens) {
-                st_mmio_b8(dispatch_send_done, 1);
-                *grid_counter = 0;
-            }
-        }
-
         if (NODE_SIZE >= 1) {
             for (unsigned token = blockIdx.x; token < num_send_tokens; token += gridDim.x) {
                 uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
@@ -529,6 +513,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         }
     }
 
+    grid.sync();
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        st_mmio_u32(dispatch_send_done, epoch);
+    }
+
     if (NODE_SIZE > 1) {
         grid.sync();
 
@@ -570,14 +559,16 @@ int a2a_kernels::a2a_dispatch_send(
     uint32_t *token_offset,
     uint32_t *num_routed,
     uint32_t *expert_offsets,
-    uint8_t *dispatch_route_done,
-    uint8_t *dispatch_send_done,
+    uint32_t *dispatch_route_done,
+    uint32_t *dispatch_send_done,
     uint8_t *tx_ready,
     uint8_t *send_buffer,
     uint32_t *grid_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint32_t *epoch_counter,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     constexpr size_t NUM_WARPS = 16;
@@ -632,6 +623,8 @@ int a2a_kernels::a2a_dispatch_send(
         &sync_counter,
         &sync_ptrs,
         &recv_ptrs,
+        &epoch_counter,
+        &current_epoch,
     };
 
     const size_t shared_memory_send = std::max(num_experts, NUM_WARPS) * sizeof(uint32_t);

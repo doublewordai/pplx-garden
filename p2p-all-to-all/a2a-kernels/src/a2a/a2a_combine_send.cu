@@ -17,6 +17,19 @@ using namespace rose;
 using namespace rose::device;
 
 
+__global__ __launch_bounds__(WARP_SIZE, 1) void a2a_wait_tx_ready_kernel(
+    uint8_t * __restrict__ tx_ready,
+    const uint32_t * __restrict__ num_recv_tokens_ptr
+) {
+    if (threadIdx.x == 0) {
+        const unsigned num_efa_tokens = __ldg(num_recv_tokens_ptr + 1);
+        if (num_efa_tokens != 0) {
+            while (ld_mmio_b8(tx_ready) == 0);
+        }
+    }
+}
+
+
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, unsigned DP_SIZE, typename TokenDim>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_kernel(
     const size_t token_dim,
@@ -30,11 +43,12 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
     const uint32_t * __restrict__ num_recv_tokens_ptr,
-    uint8_t * __restrict__ combine_send_done,
+    uint32_t * __restrict__ combine_send_done,
     uint32_t * __restrict__ token_counter,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
-    std::byte **recv_ptrs
+    std::byte **recv_ptrs,
+    uint32_t * __restrict__ current_epoch
 ) {
     TokenDim token_bound(token_dim);
     constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
@@ -48,17 +62,22 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     __shared__ Stage shared_stages[NUM_STAGES];
     Stage local_stages[NUM_STAGES];
 
-    // Local copy of peer recv ptrs.
+    // Local copy of peer recv ptrs. The pointer table is only populated when
+    // an intra-node peer group exists; with NODE_SIZE == 1, local writes target
+    // this rank's own recv buffer directly.
     std::byte *recv_ptrs_local[NODE_SIZE];
-    #pragma unroll
-    for (unsigned i = 0; i < NODE_SIZE; i++) {
-        recv_ptrs_local[i] = recv_ptrs[i];
+    if constexpr (NODE_SIZE > 1) {
+        #pragma unroll
+        for (unsigned i = 0; i < NODE_SIZE; i++) {
+            recv_ptrs_local[i] = recv_ptrs[i];
+        }
     }
 
     auto grid = cooperative_groups::this_grid();
     const unsigned rank_node = rank / NODE_SIZE;
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
 
     const unsigned num_recv_tokens = __ldg(num_recv_tokens_ptr);
     const unsigned num_efa_tokens = __ldg(num_recv_tokens_ptr + 1);
@@ -69,12 +88,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     // Synchronization counter.
     auto counter = *sync_counter;
 
-    // Wait for all transactions using the send buffer to finish before writing to it.
+    // Wait for all transactions using the send buffer to finish before writing
+    // to it. Local-node combine copies do not touch the send buffer, so do not
+    // block on tx_ready unless there is fabric-bound combine payload.
     if (warp_id == 0) {
         if (elect_one_sync()) {
-            while (ld_mmio_b8(tx_ready) == 0);
+            if (num_efa_tokens != 0) {
+                while (ld_mmio_b8(tx_ready) == 0);
+            }
             if (num_efa_tokens == 0) {
-                st_mmio_b8(combine_send_done, 1);
+                st_mmio_u32(combine_send_done, epoch);
             }
         }
     } else if (warp_id == 1) {
@@ -148,12 +171,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         shared_to_local(num_efa_tokens);
     }
 
-    if (threadIdx.x == 0) {
-        auto num_tokens = add_release_gpu_u32(token_counter, num_local_efa_tokens) + num_local_efa_tokens;
-        if (num_tokens == num_efa_tokens) {
-            st_mmio_b8(combine_send_done, 1);
-        }
+    grid.sync();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        st_mmio_u32(combine_send_done, epoch);
     }
+
+    token = blockIdx.x;
 
     if (warp_id == 0) {
         unsigned next_token = token + lane_id * gridDim.x;
@@ -195,7 +219,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node == rank_node) {
                     auto token_peer = token_rank % NODE_SIZE;
-                    auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
+                    std::byte *dst_base;
+                    if constexpr (NODE_SIZE > 1) {
+                        dst_base = recv_ptrs_local[token_peer];
+                    } else {
+                        dst_base = recv_buffer;
+                    }
+                    auto *x_token_dst = (uint4*)(dst_base + offset * token_bound);
                     st_global_nc_uint4(&x_token_dst[i], values[s]);
                 }
             }
@@ -216,7 +246,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
             if (elect_one_sync()) {
                 *sync_counter = counter + 1;
                 *token_counter = 0;
-                *tx_ready = 0;
+                if (num_efa_tokens != 0) {
+                    *tx_ready = 0;
+                }
             }
         } else if (warp_id == 1) {
             if constexpr (NODE_SIZE > 1) {
@@ -246,11 +278,12 @@ int a2a_kernels::a2a_combine_send(
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *combine_send_done,
+    uint32_t *combine_send_done,
     uint32_t *token_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
@@ -272,13 +305,32 @@ int a2a_kernels::a2a_combine_send(
         &sync_counter,
         &sync_ptrs,
         &recv_ptrs,
+        &current_epoch,
     };
 
     dim3 dimGrid(num_blocks, 1, 1);
 
     cudaError_t status;
 
+    void *wait_args[] = {
+        &tx_ready,
+        &num_recv_tokens_ptr,
+    };
+
     nvtxRangePush("combine_send");
+    status = cudaLaunchKernel(
+        (void *)&a2a_wait_tx_ready_kernel,
+        dim3(1, 1, 1),
+        dim3(WARP_SIZE, 1, 1),
+        wait_args,
+        0,
+        (cudaStream_t)stream
+    );
+    if (status != cudaSuccess) {
+        nvtxRangePop();
+        return status;
+    }
+
     LAUNCH_DP_SIZE(dp_size, DP_SIZE, {
         LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
             LAUNCH_TOKEN_DIM_COMBINE(token_dim, TokenDim, {

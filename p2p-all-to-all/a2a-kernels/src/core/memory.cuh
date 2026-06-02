@@ -41,6 +41,26 @@ __forceinline__ __device__ void st_mmio_b8(uint8_t *flag_addr, uint8_t flag) {
   );
 }
 
+__forceinline__ __device__ uint32_t ld_mmio_u32(uint32_t *flag_addr) {
+  uint32_t tmp;
+  asm volatile(
+    "{ ld.mmio.relaxed.sys.global.u32 %0, [%1]; }"
+    : "=r"(tmp)
+    : "l"(flag_addr)
+    :
+  );
+  return tmp;
+}
+
+__forceinline__ __device__ void st_mmio_u32(uint32_t *flag_addr, uint32_t flag) {
+  asm volatile(
+    "{ st.mmio.relaxed.sys.global.u32 [%1], %0; }"
+    :
+    : "r"(flag), "l"(flag_addr)
+    :
+  );
+}
+
 __forceinline__ __device__ void st_release_u32(uint32_t *flag_addr, uint32_t flag) {
   asm volatile("st.release.sys.global.u32 [%1], %0;" :: "r"(flag), "l"(flag_addr));
 }

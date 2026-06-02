@@ -4,7 +4,7 @@ use std::{
     ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
 };
 
@@ -126,6 +126,14 @@ impl GdrRead for u8 {
     }
 }
 
+impl GdrRead for u32 {
+    #[inline(always)]
+    fn read(mapped_ptr: *mut c_void) -> Self {
+        let flag = unsafe { AtomicU32::from_ptr(mapped_ptr as *mut u32) };
+        flag.load(Ordering::Acquire)
+    }
+}
+
 trait GdrWrite {
     fn write(mapped_ptr: *mut c_void, value: Self);
 }
@@ -134,6 +142,14 @@ impl GdrWrite for u8 {
     #[inline(always)]
     fn write(mapped_ptr: *mut c_void, value: Self) {
         let flag = unsafe { AtomicU8::from_ptr(mapped_ptr as *mut u8) };
+        flag.store(value, Ordering::Release);
+    }
+}
+
+impl GdrWrite for u32 {
+    #[inline(always)]
+    fn write(mapped_ptr: *mut c_void, value: Self) {
+        let flag = unsafe { AtomicU32::from_ptr(mapped_ptr as *mut u32) };
         flag.store(value, Ordering::Release);
     }
 }
@@ -186,8 +202,58 @@ impl GdrFlag {
         self.buffer.write(value as u8);
     }
 
-    fn is_set(&self) -> bool {
+    pub fn is_set(&self) -> bool {
         self.buffer.read::<u8>() != 0
+    }
+
+    pub fn wait_until_set<F>(&self, mut keep_waiting: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        while !self.is_set() {
+            if !keep_waiting() {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
+}
+
+/// Monotonic epoch value implemented using GDRCopy.
+pub struct GdrEpoch {
+    buffer: GdrBuffer,
+}
+
+impl GdrEpoch {
+    pub fn new(context: &GdrCopyContext) -> GdrResult<Self> {
+        let buffer = context.alloc_buffer(size_of::<u32>())?;
+        Ok(GdrEpoch { buffer })
+    }
+
+    pub fn get_device_ptr(&self) -> *mut u32 {
+        self.buffer.get_device_ptr() as *mut u32
+    }
+
+    pub fn set(&self, value: u32) {
+        self.buffer.write(value);
+    }
+
+    pub fn wait_for<F>(&self, target: u32, mut keep_waiting: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        while self.get() != target {
+            if !keep_waiting() {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
+
+    pub fn get(&self) -> u32 {
+        self.buffer.read::<u32>()
     }
 }
 
@@ -210,5 +276,19 @@ impl<T: Sized> GdrVec<T> {
     pub fn copy(&self, value: &[T]) {
         debug_assert!(value.len() <= self.len);
         self.buffer.copy_to(value.as_ptr() as *const c_void, size_of_val(value));
+    }
+}
+
+impl GdrVec<u32> {
+    pub fn get(&self, index: usize) -> u32 {
+        debug_assert!(index < self.len);
+        unsafe {
+            std::ptr::read_volatile(
+                self.buffer
+                    .mapped_ptr
+                    .cast::<u32>()
+                    .add(index),
+            )
+        }
     }
 }

@@ -1,16 +1,16 @@
 use std::{
-    collections::VecDeque,
     ffi::c_void,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use cuda_lib::{
     CudaDeviceId, Device,
-    gdr::{GdrCopyContext, GdrFlag, GdrVec},
+    gdr::{GdrCopyContext, GdrEpoch, GdrFlag, GdrVec},
 };
 use fabric_lib::{
     RdmaEngine, TransferEngine,
@@ -54,32 +54,43 @@ unsafe impl Send for WorkerBuffers {}
 unsafe impl Sync for WorkerBuffers {}
 
 pub(crate) struct SlotPool {
-    free_slots: Mutex<VecDeque<usize>>,
+    state: Mutex<SlotPoolState>,
     condvar: Condvar,
+}
+
+struct SlotPoolState {
+    free: Vec<bool>,
+    next_slot: usize,
 }
 
 impl SlotPool {
     pub(crate) fn new(num_slots: usize) -> Self {
         Self {
-            free_slots: Mutex::new((0..num_slots).collect()),
+            state: Mutex::new(SlotPoolState {
+                free: vec![true; num_slots],
+                next_slot: 0,
+            }),
             condvar: Condvar::new(),
         }
     }
 
     pub(crate) fn acquire(&self) -> usize {
-        let mut free_slots = self.free_slots.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(slot) = free_slots.pop_front() {
+            let slot = state.next_slot;
+            if state.free[slot] {
+                state.free[slot] = false;
+                state.next_slot = (slot + 1) % state.free.len();
                 return slot;
             }
-            free_slots = self.condvar.wait(free_slots).unwrap();
+            state = self.condvar.wait(state).unwrap();
         }
     }
 
     pub(crate) fn release(&self, slot: usize) {
-        let mut free_slots = self.free_slots.lock().unwrap();
-        if !free_slots.contains(&slot) {
-            free_slots.push_back(slot);
+        let mut state = self.state.lock().unwrap();
+        if !state.free[slot] {
+            state.free[slot] = true;
             self.condvar.notify_one();
         }
     }
@@ -87,18 +98,19 @@ impl SlotPool {
 
 #[allow(dead_code)]
 pub(crate) struct MicrobatchSlot {
-    pub(crate) dispatch_route_done: GdrFlag,
-    pub(crate) dispatch_send_done: GdrFlag,
-    pub(crate) dispatch_recv_done: GdrFlag,
-    pub(crate) combine_send_done: GdrFlag,
-    pub(crate) combine_recv_done: GdrFlag,
+    pub(crate) dispatch_route_done: GdrEpoch,
+    pub(crate) dispatch_send_done: GdrEpoch,
+    pub(crate) dispatch_recv_done: GdrEpoch,
+    pub(crate) combine_send_done: GdrEpoch,
+    pub(crate) combine_recv_done: GdrEpoch,
     pub(crate) tokens_per_expert: GdrVec<u32>,
     pub(crate) source_dispatch_offset: GdrVec<u32>,
     pub(crate) combine_send_offset: GdrVec<u32>,
     pub(crate) source_rank: GdrVec<u32>,
     pub(crate) padded_index: GdrVec<u32>,
     pub(crate) num_recv_tokens: GdrVec<u32>,
-    pub(crate) num_recv_tokens_flag: GdrFlag,
+    pub(crate) num_recv_tokens_ready: GdrEpoch,
+    pub(crate) tx_ready: GdrFlag,
     pub(crate) dispatch_recv_flag: Arc<GdrFlag>,
     pub(crate) combine_recv_flag: Arc<GdrFlag>,
 }
@@ -109,12 +121,13 @@ impl MicrobatchSlot {
         num_local_experts: usize,
         max_recv_tokens: usize,
     ) -> Result<Self> {
-        let dispatch_route_done = GdrFlag::new(gdr_context)?;
-        let dispatch_send_done = GdrFlag::new(gdr_context)?;
-        let dispatch_recv_done = GdrFlag::new(gdr_context)?;
-        let combine_send_done = GdrFlag::new(gdr_context)?;
-        let combine_recv_done = GdrFlag::new(gdr_context)?;
-        let num_recv_tokens_flag = GdrFlag::new(gdr_context)?;
+        let dispatch_route_done = GdrEpoch::new(gdr_context)?;
+        let dispatch_send_done = GdrEpoch::new(gdr_context)?;
+        let dispatch_recv_done = GdrEpoch::new(gdr_context)?;
+        let combine_send_done = GdrEpoch::new(gdr_context)?;
+        let combine_recv_done = GdrEpoch::new(gdr_context)?;
+        let num_recv_tokens_ready = GdrEpoch::new(gdr_context)?;
+        let tx_ready = GdrFlag::new(gdr_context)?;
         let dispatch_recv_flag = Arc::new(GdrFlag::new(gdr_context)?);
         let combine_recv_flag = Arc::new(GdrFlag::new(gdr_context)?);
 
@@ -126,7 +139,13 @@ impl MicrobatchSlot {
         let num_recv_tokens = GdrVec::new(gdr_context, 3)?;
 
         num_recv_tokens.copy(&[0u32, 0u32, 0u32]);
-        num_recv_tokens_flag.set(false);
+        dispatch_route_done.set(0);
+        dispatch_send_done.set(0);
+        dispatch_recv_done.set(0);
+        combine_send_done.set(0);
+        combine_recv_done.set(0);
+        num_recv_tokens_ready.set(0);
+        tx_ready.set(true);
         dispatch_recv_flag.set(false);
         combine_recv_flag.set(false);
 
@@ -142,18 +161,19 @@ impl MicrobatchSlot {
             source_rank,
             padded_index,
             num_recv_tokens,
-            num_recv_tokens_flag,
+            num_recv_tokens_ready,
+            tx_ready,
             dispatch_recv_flag,
             combine_recv_flag,
         })
     }
 
-    fn stop(&self) {
-        self.dispatch_route_done.set(true);
-        self.dispatch_send_done.set(true);
-        self.dispatch_recv_done.set(true);
-        self.combine_send_done.set(true);
-        self.combine_recv_done.set(true);
+    fn stop(&self, epoch: u32) {
+        self.dispatch_route_done.set(epoch);
+        self.dispatch_send_done.set(epoch);
+        self.dispatch_recv_done.set(epoch);
+        self.combine_send_done.set(epoch);
+        self.combine_recv_done.set(epoch);
     }
 }
 
@@ -192,7 +212,7 @@ pub(crate) struct WorkerState {
     recv_buffer_mr: MemoryRegionHandle,
     pub(crate) buffers: WorkerBuffers,
     pub(crate) slot: MicrobatchSlot,
-    pub(crate) tx_ready: Arc<GdrFlag>,
+    epoch: AtomicU32,
     route_counter: ImmCounter,
     dispatch_counter: GdrCounter,
     combine_counter: ImmCounter,
@@ -251,7 +271,6 @@ impl WorkerState {
         imm_base: u32,
         rank_handles: Vec<AllToAllRankHandle>,
         transfer_engine: Arc<TransferEngine>,
-        tx_ready: Arc<GdrFlag>,
     ) -> Result<Self> {
         let dp_rank = rank % dp_size;
         let dp_group = rank / dp_size;
@@ -371,7 +390,7 @@ impl WorkerState {
             send_buffer_mr,
             recv_buffer_mr,
             slot,
-            tx_ready,
+            epoch: AtomicU32::new(1),
             route_counter,
             dispatch_counter,
             combine_counter,
@@ -393,14 +412,14 @@ impl WorkerState {
         })
     }
 
-    fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         !self.stop_flag.load(Ordering::Relaxed)
     }
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
-        self.slot.stop();
-        self.tx_ready.set(true);
+        self.slot.stop(self.epoch.load(Ordering::Relaxed));
+        self.slot.tx_ready.set(true);
     }
 
     fn get_num_routed(&self, dp_group: usize, expert: usize) -> u32 {
@@ -441,9 +460,55 @@ impl WorkerState {
         counter.wait_while(target, || self.is_running())
     }
 
+    pub fn epoch(&self) -> u32 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    fn wait_epoch(&self, flag: &GdrEpoch, epoch: u32) -> bool {
+        flag.wait_for(epoch, || self.is_running())
+    }
+
+    fn wait_epoch_trace(
+        &self,
+        name: &str,
+        flag: &GdrEpoch,
+        epoch: u32,
+        trace: bool,
+    ) -> bool {
+        let mut last_report = Instant::now();
+        while flag.get() != epoch {
+            if !self.is_running() {
+                return false;
+            }
+            if trace && last_report.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting {} observed={}",
+                    self.rank,
+                    self.slot_idx,
+                    epoch,
+                    name,
+                    flag.get()
+                );
+                last_report = Instant::now();
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
+
     fn step(&self) {
+        let epoch = self.epoch();
+        let trace = std::env::var_os("PPLX_GARDEN_TRACE").is_some();
+
         // Wait for the device to copy the routing info to the host.
-        self.slot.dispatch_route_done.wait();
+        if !self.wait_epoch_trace(
+            "dispatch_route_done",
+            &self.slot.dispatch_route_done,
+            epoch,
+            trace,
+        ) {
+            return;
+        }
         if !self.is_running() {
             return;
         }
@@ -458,21 +523,68 @@ impl WorkerState {
             .unwrap();
 
         // Wait for the dispatch kernel to copy tokens into send buffers.
-        self.slot.dispatch_send_done.wait();
-        self.tx_ready.set(false);
+        if !self.wait_epoch_trace(
+            "dispatch_send_done",
+            &self.slot.dispatch_send_done,
+            epoch,
+            trace,
+        ) {
+            return;
+        }
+        self.slot.tx_ready.set(false);
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} dispatch_send_done observed; tx_ready cleared",
+                self.rank,
+                self.slot_idx,
+                epoch
+            );
+        }
         if !self.is_running() {
             return;
         }
 
         // Trigger transfers into private recv buffers.
         let num_private_ranges = self.dispatch_initial_routes();
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} dispatch_initial_routes num_private_ranges={}",
+                self.rank,
+                self.slot_idx,
+                epoch,
+                num_private_ranges
+            );
+        }
 
         // Wait for the routing information to arrive and aggregate it.
         let num_dp_groups = (self.world_size / self.dp_size) as u32;
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} waiting route imm target={} world_size={} dp_size={} node_size={}",
+                self.rank,
+                self.slot_idx,
+                epoch,
+                num_dp_groups - 1,
+                self.world_size,
+                self.dp_size,
+                self.node_size
+            );
+        }
         if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
             return;
         }
-        let route = self.process_routing_info();
+        let route = self.process_routing_info(epoch);
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} route processed num_recv_tx={} dispatch_ranges={} combine_ranges={}",
+                self.rank,
+                self.slot_idx,
+                epoch,
+                route.num_recv_tx,
+                route.dispatch_ranges.len(),
+                route.combine_ranges.len()
+            );
+        }
 
         // Register a callback to wait for the expected number of immediates.
         let num_shards = self.transfer_engine.nets_per_gpu().get() as u32;
@@ -505,27 +617,95 @@ impl WorkerState {
             }
 
             // Wait for the dispatch counter to settle and signal the kernel.
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting dispatch counter target={}",
+                    self.rank,
+                    self.slot_idx,
+                    epoch,
+                    route.num_recv_tx
+                );
+            }
             self.dispatch_counter.wait(route.num_recv_tx);
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} dispatch counter observed",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
 
             // Wait for the dispatch kernel to complete. It is triggered once
             // the immediate counter reaches zero by setting the dispatch recv flag.
-            self.slot.dispatch_recv_done.wait();
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting dispatch_recv_done",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
+            if !self.wait_epoch(
+                &self.slot.dispatch_recv_done,
+                epoch,
+            ) {
+                return;
+            }
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} dispatch_recv_done observed",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
 
             range_end!(dispatch_range);
         }
         if !self.barrier(
+            "dispatch",
             self.dispatch_barrier_write_op.clone(),
             &self.dispatch_barrier_counter,
             num_dispatch_tx,
         ) {
             return;
         }
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} dispatch barrier complete num_dispatch_tx={}",
+                self.rank,
+                self.slot_idx,
+                epoch,
+                num_dispatch_tx
+            );
+        }
 
         // Combine stage.
         {
-            self.slot.combine_send_done.wait();
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting combine_send_done num_combine_imm={} combine_ranges={}",
+                    self.rank,
+                    self.slot_idx,
+                    epoch,
+                    num_combine_imm,
+                    route.combine_ranges.len()
+                );
+            }
+            if !self.wait_epoch(&self.slot.combine_send_done, epoch) {
+                return;
+            }
             if !self.is_running() {
                 return;
+            }
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} combine_send_done observed",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
             }
 
             // Sent the tokens.
@@ -548,24 +728,69 @@ impl WorkerState {
             }
 
             // Wait for all remote writes to complete.
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting combine imm target={}",
+                    self.rank,
+                    self.slot_idx,
+                    epoch,
+                    num_combine_imm
+                );
+            }
             if !self.wait_imm(&self.combine_counter, num_combine_imm) {
                 return;
             }
             self.slot.combine_recv_flag.set(true);
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} combine imm observed; recv flag set",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
 
             // Let the recv phase output the tokens and proceed forward.
-            self.slot.combine_recv_done.wait();
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} waiting combine_recv_done",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
+            if !self.wait_epoch(&self.slot.combine_recv_done, epoch) {
+                return;
+            }
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} combine_recv_done observed",
+                    self.rank,
+                    self.slot_idx,
+                    epoch
+                );
+            }
 
             range_end!(combine_range);
         }
 
         if !self.barrier(
+            "combine",
             self.combine_barrier_write_op.clone(),
             &self.combine_barrier_counter,
             num_combine_tx,
         ) {
             return;
         }
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} epoch={} combine barrier complete; releasing slot",
+                self.rank,
+                self.slot_idx,
+                epoch
+            );
+        }
+        self.epoch.fetch_add(1, Ordering::Release);
         self.slot_pool.release(self.slot_idx);
     }
 
@@ -639,7 +864,7 @@ impl WorkerState {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn process_routing_info(&self) -> RoutingInfo {
+    fn process_routing_info(&self, epoch: u32) -> RoutingInfo {
         // Determine counts on the current rank.
         let process_routing_info_range = range_start!("process_routing_info");
 
@@ -814,8 +1039,8 @@ impl WorkerState {
         self.slot.combine_send_offset.copy(&combine_send_offset);
         self.slot
             .num_recv_tokens
-            .copy(&[num_recv_tokens as u32, num_recv_efa_tokens as u32]);
-        self.slot.num_recv_tokens_flag.set(true);
+            .copy(&[num_recv_tokens as u32, num_recv_efa_tokens as u32, 0]);
+        self.slot.num_recv_tokens_ready.set(epoch);
 
         // Prepare the dispatch commands, beyond the private recv buffers.
         let mut dispatch_ranges = Vec::with_capacity(self.world_size - 1);
@@ -929,11 +1154,22 @@ impl WorkerState {
 
     fn barrier(
         &self,
+        label: &str,
         request: TransferRequest,
         imm_counter: &ImmCounter,
         num_tx: u32,
     ) -> bool {
         let barrier = range_start!("barrier");
+        let trace = std::env::var_os("PPLX_GARDEN_TRACE").is_some();
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} barrier={} submitting num_tx={}",
+                self.rank,
+                self.slot_idx,
+                label,
+                num_tx
+            );
+        }
 
         self.transfer_engine
             .submit_transfer_atomic(
@@ -944,14 +1180,41 @@ impl WorkerState {
             .unwrap();
 
         // Wait for all payloads to be received.
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} barrier={} waiting imm target={}",
+                self.rank,
+                self.slot_idx,
+                label,
+                self.world_size - 1
+            );
+        }
         if !self.wait_imm(imm_counter, (self.world_size - 1) as u32) {
             range_end!(barrier);
             return false;
+        }
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} barrier={} imm observed",
+                self.rank,
+                self.slot_idx,
+                label
+            );
         }
 
         // Wait for the sends to complete.
         let num_tx_total = num_tx as i64 + 1;
         let old = self.tx_counter.fetch_sub(num_tx_total, Ordering::Relaxed);
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} barrier={} waiting tx_counter old={} subtract={}",
+                self.rank,
+                self.slot_idx,
+                label,
+                old,
+                num_tx_total
+            );
+        }
         if old < num_tx_total {
             while self.tx_counter.load(Ordering::Relaxed) < 0 {
                 if !self.is_running() {
@@ -961,7 +1224,15 @@ impl WorkerState {
                 std::thread::yield_now();
             }
         }
-        self.tx_ready.set(true);
+        self.slot.tx_ready.set(true);
+        if trace {
+            eprintln!(
+                "PPLX worker rank={} slot={} barrier={} tx_ready set",
+                self.rank,
+                self.slot_idx,
+                label
+            );
+        }
 
         range_end!(barrier);
         true

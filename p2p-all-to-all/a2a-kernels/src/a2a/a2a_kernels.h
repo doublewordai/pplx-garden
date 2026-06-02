@@ -41,14 +41,16 @@ int a2a_dispatch_send(
     uint32_t *token_offset,
     uint32_t *num_routed,
     uint32_t *expert_offsets,
-    uint8_t *dispatch_route_done,
-    uint8_t *dispatch_send_done,
+    uint32_t *dispatch_route_done,
+    uint32_t *dispatch_send_done,
     uint8_t *tx_ready,
     uint8_t *send_buffer,
     uint32_t *grid_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint32_t *epoch_counter,
+    uint32_t *current_epoch,
     uint64_t stream
 );
 
@@ -77,13 +79,14 @@ int a2a_dispatch_recv(
     uint32_t *padded_index,
     uint32_t *num_routed,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *num_recv_tokens_flag,
+    uint32_t *num_recv_tokens_ready,
     uint8_t *dispatch_recv_flag,
-    uint8_t *dispatch_recv_done,
+    uint32_t *dispatch_recv_done,
     uint32_t *grid_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **send_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 );
 
@@ -103,11 +106,12 @@ int a2a_combine_send(
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *combine_send_done,
+    uint32_t *combine_send_done,
     uint32_t *token_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 );
 
@@ -123,6 +127,8 @@ int a2a_combine_recv(
     size_t node_size,
     size_t world_size,
     size_t num_tokens,
+    size_t num_recv_tokens,
+    size_t max_recv_tokens,
     const int32_t *bound_m_ptr,
     const int32_t *indices_ptr,
     size_t indices_stride,
@@ -135,9 +141,10 @@ int a2a_combine_recv(
     uint32_t *token_offset,
     uint32_t *expert_offsets,
     uint8_t *combine_recv_flag,
-    uint8_t *combine_recv_done,
+    uint32_t *combine_recv_done,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 );
 

@@ -247,9 +247,12 @@ impl GdrCounter {
 
     pub fn wait(&self, target: u32) {
         let old = self.counter.fetch_sub(target as i64, Ordering::Relaxed);
-        if old >= target as i64 {
-            self.flag.set(true);
+        if old < target as i64 {
+            while self.counter.load(Ordering::Relaxed) < 0 {
+                std::hint::spin_loop();
+            }
         }
+        self.flag.set(true);
     }
 }
 
