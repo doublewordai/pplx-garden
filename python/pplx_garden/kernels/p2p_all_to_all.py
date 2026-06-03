@@ -46,9 +46,9 @@ class _RdmaRankData:
 
 @dataclass
 class _NVLRankData:
-    sync_fd: CUMemExportHandle
-    send_fd: CUMemExportHandle
-    recv_fd: CUMemExportHandle
+    sync_fds: list[CUMemExportHandle]
+    send_fds: list[CUMemExportHandle]
+    recv_fds: list[CUMemExportHandle]
 
 
 @dataclass
@@ -341,64 +341,96 @@ class P2PAllToAll(AllToAllKernel):
             recv_buffer_descs.append(recv_buffer_desc)
 
         # Exchange NVLink buffers.
-        self._nvl_mappings: list[_NVLRankMapping] = []
-        sync_ptrs: list[int] = []
-        send_ptrs: list[int] = []
-        recv_ptrs: list[int] = []
+        self._nvl_mappings: list[list[_NVLRankMapping]] = []
+        sync_ptrs: list[list[int]] = [[] for _ in range(num_slots)]
+        send_ptrs: list[list[int]] = [[] for _ in range(num_slots)]
+        recv_ptrs: list[list[int]] = [[] for _ in range(num_slots)]
         if self._node_group is not None:
             logger.info(
                 "Setting up RDMA (%d) + NVLink (%d)",
                 global_group.size,
                 self._node_group.size,
             )
-            self._sync_buffer_handle = CUMemAllocHandle(
-                torch.uint32.itemsize * self._node_group.size * 2,
-                self._device,
-                self._handle_kind,
-            )
-            sync_mapping = self._sync_buffer_handle.map(self._device)
-            sync_mapping.to_tensor(
-                (self._node_group.size * 2,),
-                torch.uint32,
-            ).fill_(0)
+            self._sync_buffer_handles = [
+                CUMemAllocHandle(
+                    torch.uint32.itemsize * self._node_group.size * 2,
+                    self._device,
+                    self._handle_kind,
+                )
+                for _ in range(num_slots)
+            ]
+            sync_mappings = [
+                handle.map(self._device) for handle in self._sync_buffer_handles
+            ]
+            for sync_mapping in sync_mappings:
+                sync_mapping.to_tensor(
+                    (self._node_group.size * 2,),
+                    torch.uint32,
+                ).fill_(0)
 
             local_handle = _NVLRankData(
-                sync_fd=self._sync_buffer_handle.export(),
-                send_fd=self._send_buffer_handles[0].export(),
-                recv_fd=self._recv_buffer_handles[0].export(),
+                sync_fds=[handle.export() for handle in self._sync_buffer_handles],
+                send_fds=[handle.export() for handle in self._send_buffer_handles],
+                recv_fds=[handle.export() for handle in self._recv_buffer_handles],
             )
             handles = self._node_group.all_gather_object(pickle.dumps(local_handle))
 
+            self._nvl_mappings = [[] for _ in range(num_slots)]
             for peer, h in enumerate(handles):
                 if peer == self._node_group.rank:
-                    self._nvl_mappings.append(
-                        _NVLRankMapping(
-                            sync_mapping=sync_mapping,
-                            send_mapping=self._send_buffer_mappings[0],
-                            recv_mapping=self._recv_buffer_mappings[0],
+                    for slot in range(num_slots):
+                        self._nvl_mappings[slot].append(
+                            _NVLRankMapping(
+                                sync_mapping=sync_mappings[slot],
+                                send_mapping=self._send_buffer_mappings[slot],
+                                recv_mapping=self._recv_buffer_mappings[slot],
+                            )
                         )
-                    )
                 else:
                     assert h is not None
                     peer_data = pickle.loads(h)
                     assert isinstance(peer_data, _NVLRankData)
-                    self._nvl_mappings.append(
-                        _NVLRankMapping(
-                            sync_mapping=peer_data.sync_fd.bind().map(self._device),
-                            send_mapping=peer_data.send_fd.bind().map(self._device),
-                            recv_mapping=peer_data.recv_fd.bind().map(self._device),
+                    if (
+                        len(peer_data.sync_fds) != num_slots
+                        or len(peer_data.send_fds) != num_slots
+                        or len(peer_data.recv_fds) != num_slots
+                    ):
+                        raise RuntimeError(
+                            "Peer NVLink handle slot count mismatch: "
+                            f"expected {num_slots}, got sync={len(peer_data.sync_fds)} "
+                            f"send={len(peer_data.send_fds)} recv={len(peer_data.recv_fds)}"
                         )
-                    )
+                    for slot in range(num_slots):
+                        self._nvl_mappings[slot].append(
+                            _NVLRankMapping(
+                                sync_mapping=peer_data.sync_fds[slot]
+                                .bind()
+                                .map(self._device),
+                                send_mapping=peer_data.send_fds[slot]
+                                .bind()
+                                .map(self._device),
+                                recv_mapping=peer_data.recv_fds[slot]
+                                .bind()
+                                .map(self._device),
+                            )
+                        )
                     del peer_data
 
             self._node_group.barrier()
             del local_handle
 
             node_size = self._node_group.size
-            for i in range(node_size):
-                recv_ptrs.append(self._nvl_mappings[i].recv_mapping.data_ptr())
-                send_ptrs.append(self._nvl_mappings[i].send_mapping.data_ptr())
-                sync_ptrs.append(self._nvl_mappings[i].sync_mapping.data_ptr())
+            for slot in range(num_slots):
+                for i in range(node_size):
+                    recv_ptrs[slot].append(
+                        self._nvl_mappings[slot][i].recv_mapping.data_ptr()
+                    )
+                    send_ptrs[slot].append(
+                        self._nvl_mappings[slot][i].send_mapping.data_ptr()
+                    )
+                    sync_ptrs[slot].append(
+                        self._nvl_mappings[slot][i].sync_mapping.data_ptr()
+                    )
         else:
             logger.info("Setting up RDMA (%d)", global_group.size)
             node_size = 1

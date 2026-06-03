@@ -38,9 +38,9 @@ class AllToAllContext:
         send_buffer_mr: MemoryRegionHandle,
         recv_buffer_ptr: int,
         recv_buffer_mr: MemoryRegionHandle,
-        sync_ptrs: list[int],
-        send_ptrs: list[int],
-        recv_ptrs: list[int],
+        sync_ptrs: list[list[int]],
+        send_ptrs: list[list[int]],
+        recv_ptrs: list[list[int]],
         device: int,
         imm_base: int,
         ranks: list[

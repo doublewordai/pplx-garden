@@ -172,9 +172,9 @@ impl AllToAllContext {
         send_buffer_mrs: Vec<MemoryRegionHandle>,
         recv_buffer_ptrs: Vec<*mut c_void>,
         recv_buffer_mrs: Vec<MemoryRegionHandle>,
-        sync_ptrs: Vec<u64>,
-        send_ptrs: Vec<u64>,
-        recv_ptrs: Vec<u64>,
+        sync_ptrs: Vec<Vec<u64>>,
+        send_ptrs: Vec<Vec<u64>>,
+        recv_ptrs: Vec<Vec<u64>>,
         device: u8,
         imm_base: u32,
         rank_handles: Vec<Vec<AllToAllRankHandle>>,
@@ -217,6 +217,18 @@ impl AllToAllContext {
                 rank_handles.len()
             ));
         }
+        if sync_ptrs.len() != num_slots
+            || send_ptrs.len() != num_slots
+            || recv_ptrs.len() != num_slots
+        {
+            return Err(anyhow!(
+                "Expected {} NVLink pointer sets, got sync {} send {} recv {}",
+                num_slots,
+                sync_ptrs.len(),
+                send_ptrs.len(),
+                recv_ptrs.len()
+            ));
+        }
         let slot_pool = Arc::new(SlotPool::new(num_slots));
 
         let mut workers = Vec::with_capacity(num_slots);
@@ -229,9 +241,9 @@ impl AllToAllContext {
                 num_experts,
                 max_num_tokens,
                 num_experts_per_token,
-                &sync_ptrs,
-                &send_ptrs,
-                &recv_ptrs,
+                &sync_ptrs[slot_idx],
+                &send_ptrs[slot_idx],
+                &recv_ptrs[slot_idx],
             )?;
 
             let slot_imm_base = imm_base + (slot_idx as u32) * 5;

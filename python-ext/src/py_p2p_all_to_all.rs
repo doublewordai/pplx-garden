@@ -47,9 +47,9 @@ impl PyAllToAllContext {
         send_buffer_mrs: Vec<PyMemoryRegionHandle>,
         recv_buffer_ptrs: Vec<u64>,
         recv_buffer_mrs: Vec<PyMemoryRegionHandle>,
-        sync_ptrs: Vec<u64>,
-        send_ptrs: Vec<u64>,
-        recv_ptrs: Vec<u64>,
+        sync_ptrs: Vec<Vec<u64>>,
+        send_ptrs: Vec<Vec<u64>>,
+        recv_ptrs: Vec<Vec<u64>>,
         device: u8,
         imm_base: u32,
         ranks: Vec<(
