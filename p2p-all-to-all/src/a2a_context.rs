@@ -815,6 +815,9 @@ impl AllToAllContext {
             .map(|(slot, worker)| {
                 let mut state: AllToAllSlotDebugState = worker.debug_state().into();
                 state.rust_slot_free = self.slot_pool.is_free(slot);
+                if state.rust_slot_free {
+                    state.phase = "free";
+                }
                 state
             })
             .collect()
