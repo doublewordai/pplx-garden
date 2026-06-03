@@ -37,6 +37,10 @@ def reset_all_cuda_graph_capture_slots() -> None:
         kernel.reset_cuda_graph_capture_slots()
 
 
+def has_cuda_graph_capture_kernels() -> bool:
+    return any(True for _ in _CUDA_GRAPH_KERNELS)
+
+
 @dataclass
 class _RdmaRankData:
     address: bytes
