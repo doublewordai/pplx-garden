@@ -49,6 +49,7 @@ pub(crate) enum WorkerPhase {
     WaitingCombineBarrierTx = 12,
     ReleasingSlot = 13,
     Stopped = 14,
+    Free = 15,
 }
 
 impl WorkerPhase {
@@ -69,6 +70,7 @@ impl WorkerPhase {
             Self::WaitingCombineBarrierTx => "waiting_combine_barrier_tx",
             Self::ReleasingSlot => "releasing_slot",
             Self::Stopped => "stopped",
+            Self::Free => "free",
         }
     }
 
@@ -88,6 +90,8 @@ impl WorkerPhase {
             11 => Self::WaitingCombineBarrierImm,
             12 => Self::WaitingCombineBarrierTx,
             13 => Self::ReleasingSlot,
+            14 => Self::Stopped,
+            15 => Self::Free,
             _ => Self::Stopped,
         }
     }
@@ -503,7 +507,7 @@ impl WorkerState {
             accumulated_network_combine_bytes: AtomicU64::new(0),
             peer_dispatch_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
             peer_combine_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
-            phase: AtomicU32::new(WorkerPhase::WaitingDispatchRouteDone as u32),
+            phase: AtomicU32::new(WorkerPhase::Free as u32),
             wait_target: AtomicU32::new(0),
             wait_observed: AtomicI64::new(0),
         })
@@ -922,6 +926,7 @@ impl WorkerState {
         }
         self.set_phase(WorkerPhase::ReleasingSlot);
         self.epoch.fetch_add(1, Ordering::Release);
+        self.set_phase(WorkerPhase::Free);
         self.slot_pool.release(self.slot_idx);
     }
 
