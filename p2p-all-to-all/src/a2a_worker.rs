@@ -181,6 +181,10 @@ impl SlotPool {
             self.condvar.notify_one();
         }
     }
+
+    pub(crate) fn is_free(&self, slot: usize) -> bool {
+        self.state.lock().unwrap().free[slot]
+    }
 }
 
 #[allow(dead_code)]

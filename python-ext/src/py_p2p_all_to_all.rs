@@ -301,6 +301,7 @@ impl PyAllToAllContext {
                 dict.set_item("phase", state.phase)?;
                 dict.set_item("wait_target", state.wait_target)?;
                 dict.set_item("wait_observed", state.wait_observed)?;
+                dict.set_item("rust_slot_free", state.rust_slot_free)?;
                 dict.set_item("dispatch_route_done", state.dispatch_route_done)?;
                 dict.set_item("dispatch_send_done", state.dispatch_send_done)?;
                 dict.set_item("num_recv_tokens_ready", state.num_recv_tokens_ready)?;

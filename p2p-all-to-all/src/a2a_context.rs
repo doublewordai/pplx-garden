@@ -809,7 +809,15 @@ impl AllToAllContext {
     }
 
     pub fn get_debug_state(&self) -> Vec<AllToAllSlotDebugState> {
-        self.workers.iter().map(|worker| worker.debug_state().into()).collect()
+        self.workers
+            .iter()
+            .enumerate()
+            .map(|(slot, worker)| {
+                let mut state: AllToAllSlotDebugState = worker.debug_state().into();
+                state.rust_slot_free = self.slot_pool.is_free(slot);
+                state
+            })
+            .collect()
     }
 }
 
@@ -831,6 +839,7 @@ pub struct AllToAllSlotDebugState {
     pub phase: &'static str,
     pub wait_target: u32,
     pub wait_observed: i64,
+    pub rust_slot_free: bool,
     pub dispatch_route_done: u32,
     pub dispatch_send_done: u32,
     pub num_recv_tokens_ready: u32,
@@ -851,6 +860,7 @@ impl From<WorkerDebugState> for AllToAllSlotDebugState {
             phase: state.phase.as_str(),
             wait_target: state.wait_target,
             wait_observed: state.wait_observed,
+            rust_slot_free: false,
             dispatch_route_done: state.dispatch_route_done,
             dispatch_send_done: state.dispatch_send_done,
             num_recv_tokens_ready: state.num_recv_tokens_ready,
