@@ -110,15 +110,9 @@ impl PyAllToAllContext {
             world_size,
             num_routed_ptrs.into_iter().map(|ptr| ptr as *mut u32).collect(),
             num_routed_mrs.into_iter().map(|mr| mr.0).collect(),
-            send_buffer_ptrs
-                .into_iter()
-                .map(|ptr| ptr as *mut c_void)
-                .collect(),
+            send_buffer_ptrs.into_iter().map(|ptr| ptr as *mut c_void).collect(),
             send_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
-            recv_buffer_ptrs
-                .into_iter()
-                .map(|ptr| ptr as *mut c_void)
-                .collect(),
+            recv_buffer_ptrs.into_iter().map(|ptr| ptr as *mut c_void).collect(),
             recv_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
             sync_ptrs,
             send_ptrs,
@@ -290,6 +284,35 @@ impl PyAllToAllContext {
         dict.set_item("peer_dispatch_bytes", &stats.peer_dispatch_bytes)?;
         dict.set_item("peer_combine_bytes", &stats.peer_combine_bytes)?;
         Ok(dict)
+    }
+
+    fn get_debug_state<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.ctx
+            .get_debug_state()
+            .into_iter()
+            .map(|state| {
+                let dict = PyDict::new(py);
+                dict.set_item("rank", state.rank)?;
+                dict.set_item("slot", state.slot)?;
+                dict.set_item("epoch", state.epoch)?;
+                dict.set_item("phase", state.phase)?;
+                dict.set_item("wait_target", state.wait_target)?;
+                dict.set_item("wait_observed", state.wait_observed)?;
+                dict.set_item("dispatch_route_done", state.dispatch_route_done)?;
+                dict.set_item("dispatch_send_done", state.dispatch_send_done)?;
+                dict.set_item("num_recv_tokens_ready", state.num_recv_tokens_ready)?;
+                dict.set_item("dispatch_recv_done", state.dispatch_recv_done)?;
+                dict.set_item("combine_send_done", state.combine_send_done)?;
+                dict.set_item("combine_recv_done", state.combine_recv_done)?;
+                dict.set_item("dispatch_recv_flag", state.dispatch_recv_flag)?;
+                dict.set_item("combine_recv_flag", state.combine_recv_flag)?;
+                dict.set_item("tx_ready", state.tx_ready)?;
+                Ok(dict)
+            })
+            .collect()
     }
 }
 

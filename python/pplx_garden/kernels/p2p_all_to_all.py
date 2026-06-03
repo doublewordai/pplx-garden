@@ -498,6 +498,9 @@ class P2PAllToAll(AllToAllKernel):
         global_group.barrier()
 
     def reset_cuda_graph_capture_slots(self) -> None:
+        # This is capture bookkeeping only. Runtime slot lifetime is owned by
+        # the Rust worker, which releases a slot after combine-recv and the
+        # final combine barrier.
         self._capture_free_slots = list(range(self._num_slots))
 
     def _acquire_cuda_graph_capture_slot(self) -> int:
@@ -912,6 +915,15 @@ class P2PAllToAll(AllToAllKernel):
         if self._all_to_all is None:
             return {}
         return self._all_to_all.get_perf_stats()
+
+    def get_debug_state(self) -> list[dict[str, Any]]:
+        if self._all_to_all is None:
+            return []
+        state = self._all_to_all.get_debug_state()
+        for slot in state:
+            slot["python_capture_free"] = slot["slot"] in self._capture_free_slots
+            slot["python_sync_slot"] = self._sync_slot
+        return state
 
     @override
     def destroy(self) -> None:

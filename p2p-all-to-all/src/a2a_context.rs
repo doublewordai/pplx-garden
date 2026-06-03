@@ -16,7 +16,7 @@ use torch_lib::ScalarType;
 
 use crate::{
     a2a_handles::AllToAllRankHandle,
-    a2a_worker::{SlotPool, WorkerState},
+    a2a_worker::{SlotPool, WorkerDebugState, WorkerState},
 };
 
 // Collects the private workspace buffers used by dispatch and combine.
@@ -461,11 +461,7 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX dispatch_send rank={} slot={} epoch={} launching kernel num_tokens={} stream={}",
-                rank,
-                slot,
-                epoch,
-                num_tokens,
-                stream,
+                rank, slot, epoch, num_tokens, stream,
             );
         }
 
@@ -512,14 +508,14 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX dispatch_send rank={} slot={} epoch={} kernel launch returned",
-                rank,
-                slot,
-                epoch,
+                rank, slot, epoch,
             );
         }
 
         if worker.failed() {
-            return Err(anyhow!("a2a_dispatch_send slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_dispatch_send slot {slot}: fabric-lib transfer error"
+            ));
         }
         Ok(slot)
     }
@@ -587,7 +583,9 @@ impl AllToAllContext {
         .map_err(|e| anyhow!("a2a_dispatch_recv slot {slot}: {e}"))?;
 
         if worker.failed() {
-            return Err(anyhow!("a2a_dispatch_recv slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_dispatch_recv slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         Ok(())
@@ -619,9 +617,7 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX combine_send rank={} slot={} epoch={} launching kernel",
-                rank,
-                slot,
-                epoch
+                rank, slot, epoch
             );
         }
 
@@ -653,14 +649,14 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX combine_send rank={} slot={} epoch={} kernel launch returned",
-                rank,
-                slot,
-                epoch
+                rank, slot, epoch
             );
         }
 
         if worker.failed() {
-            return Err(anyhow!("a2a_combine_send slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_combine_send slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         Ok(())
@@ -762,7 +758,9 @@ impl AllToAllContext {
         .map_err(|e| anyhow!("a2a_combine_recv slot {slot}: {e}"))?;
 
         if worker.failed() {
-            return Err(anyhow!("a2a_combine_recv slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_combine_recv slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         Ok(())
@@ -809,6 +807,10 @@ impl AllToAllContext {
         }
         stats
     }
+
+    pub fn get_debug_state(&self) -> Vec<AllToAllSlotDebugState> {
+        self.workers.iter().map(|worker| worker.debug_state().into()).collect()
+    }
 }
 
 pub struct AllToAllPerfStats {
@@ -820,6 +822,46 @@ pub struct AllToAllPerfStats {
     pub network_combine_bytes: u64,
     pub peer_dispatch_bytes: Vec<u64>,
     pub peer_combine_bytes: Vec<u64>,
+}
+
+pub struct AllToAllSlotDebugState {
+    pub rank: usize,
+    pub slot: usize,
+    pub epoch: u32,
+    pub phase: &'static str,
+    pub wait_target: u32,
+    pub wait_observed: i64,
+    pub dispatch_route_done: u32,
+    pub dispatch_send_done: u32,
+    pub num_recv_tokens_ready: u32,
+    pub dispatch_recv_done: u32,
+    pub combine_send_done: u32,
+    pub combine_recv_done: u32,
+    pub dispatch_recv_flag: bool,
+    pub combine_recv_flag: bool,
+    pub tx_ready: bool,
+}
+
+impl From<WorkerDebugState> for AllToAllSlotDebugState {
+    fn from(state: WorkerDebugState) -> Self {
+        Self {
+            rank: state.rank,
+            slot: state.slot,
+            epoch: state.epoch,
+            phase: state.phase.as_str(),
+            wait_target: state.wait_target,
+            wait_observed: state.wait_observed,
+            dispatch_route_done: state.dispatch_route_done,
+            dispatch_send_done: state.dispatch_send_done,
+            num_recv_tokens_ready: state.num_recv_tokens_ready,
+            dispatch_recv_done: state.dispatch_recv_done,
+            combine_send_done: state.combine_send_done,
+            combine_recv_done: state.combine_recv_done,
+            dispatch_recv_flag: state.dispatch_recv_flag,
+            combine_recv_flag: state.combine_recv_flag,
+            tx_ready: state.tx_ready,
+        }
+    }
 }
 
 impl Drop for AllToAllContext {

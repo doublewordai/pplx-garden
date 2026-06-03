@@ -283,12 +283,7 @@ impl GdrVec<u32> {
     pub fn get(&self, index: usize) -> u32 {
         debug_assert!(index < self.len);
         unsafe {
-            std::ptr::read_volatile(
-                self.buffer
-                    .mapped_ptr
-                    .cast::<u32>()
-                    .add(index),
-            )
+            std::ptr::read_volatile(self.buffer.mapped_ptr.cast::<u32>().add(index))
         }
     }
 }

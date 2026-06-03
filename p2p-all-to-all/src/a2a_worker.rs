@@ -24,6 +24,93 @@ use nvtx::{range_end, range_start};
 
 use crate::a2a_handles::AllToAllRankHandle;
 
+/// Canonical slot lifecycle.
+///
+/// A slot is owned by the Rust worker from dispatch-send until the worker has
+/// observed combine-recv completion, finished the combine barrier, advanced the
+/// epoch, and returned the slot to the pool. Python/CUDA graph code may choose
+/// fixed slot identities, but it must not treat enqueue completion as slot
+/// lifetime completion.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum WorkerPhase {
+    WaitingDispatchRouteDone = 0,
+    WaitingDispatchSendDone = 1,
+    WaitingRouteImm = 2,
+    ProcessingRoute = 3,
+    WaitingDispatchCounter = 4,
+    WaitingDispatchRecvDone = 5,
+    WaitingDispatchBarrierImm = 6,
+    WaitingDispatchBarrierTx = 7,
+    WaitingCombineSendDone = 8,
+    WaitingCombineImm = 9,
+    WaitingCombineRecvDone = 10,
+    WaitingCombineBarrierImm = 11,
+    WaitingCombineBarrierTx = 12,
+    ReleasingSlot = 13,
+    Stopped = 14,
+}
+
+impl WorkerPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingDispatchRouteDone => "waiting_dispatch_route_done",
+            Self::WaitingDispatchSendDone => "waiting_dispatch_send_done",
+            Self::WaitingRouteImm => "waiting_route_imm",
+            Self::ProcessingRoute => "processing_route",
+            Self::WaitingDispatchCounter => "waiting_dispatch_counter",
+            Self::WaitingDispatchRecvDone => "waiting_dispatch_recv_done",
+            Self::WaitingDispatchBarrierImm => "waiting_dispatch_barrier_imm",
+            Self::WaitingDispatchBarrierTx => "waiting_dispatch_barrier_tx",
+            Self::WaitingCombineSendDone => "waiting_combine_send_done",
+            Self::WaitingCombineImm => "waiting_combine_imm",
+            Self::WaitingCombineRecvDone => "waiting_combine_recv_done",
+            Self::WaitingCombineBarrierImm => "waiting_combine_barrier_imm",
+            Self::WaitingCombineBarrierTx => "waiting_combine_barrier_tx",
+            Self::ReleasingSlot => "releasing_slot",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn from_u32(value: u32) -> Self {
+        match value {
+            0 => Self::WaitingDispatchRouteDone,
+            1 => Self::WaitingDispatchSendDone,
+            2 => Self::WaitingRouteImm,
+            3 => Self::ProcessingRoute,
+            4 => Self::WaitingDispatchCounter,
+            5 => Self::WaitingDispatchRecvDone,
+            6 => Self::WaitingDispatchBarrierImm,
+            7 => Self::WaitingDispatchBarrierTx,
+            8 => Self::WaitingCombineSendDone,
+            9 => Self::WaitingCombineImm,
+            10 => Self::WaitingCombineRecvDone,
+            11 => Self::WaitingCombineBarrierImm,
+            12 => Self::WaitingCombineBarrierTx,
+            13 => Self::ReleasingSlot,
+            _ => Self::Stopped,
+        }
+    }
+}
+
+pub(crate) struct WorkerDebugState {
+    pub(crate) rank: usize,
+    pub(crate) slot: usize,
+    pub(crate) epoch: u32,
+    pub(crate) phase: WorkerPhase,
+    pub(crate) wait_target: u32,
+    pub(crate) wait_observed: i64,
+    pub(crate) dispatch_route_done: u32,
+    pub(crate) dispatch_send_done: u32,
+    pub(crate) num_recv_tokens_ready: u32,
+    pub(crate) dispatch_recv_done: u32,
+    pub(crate) combine_send_done: u32,
+    pub(crate) combine_recv_done: u32,
+    pub(crate) dispatch_recv_flag: bool,
+    pub(crate) combine_recv_flag: bool,
+    pub(crate) tx_ready: bool,
+}
+
 fn compute_padded_offsets(
     tokens_per_expert: &[u32],
     expert_padding: usize,
@@ -231,6 +318,9 @@ pub(crate) struct WorkerState {
     pub(crate) accumulated_network_combine_bytes: AtomicU64,
     pub(crate) peer_dispatch_bytes: Vec<AtomicU64>,
     pub(crate) peer_combine_bytes: Vec<AtomicU64>,
+    phase: AtomicU32,
+    wait_target: AtomicU32,
+    wait_observed: AtomicI64,
 }
 
 #[derive(Debug)]
@@ -409,6 +499,9 @@ impl WorkerState {
             accumulated_network_combine_bytes: AtomicU64::new(0),
             peer_dispatch_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
             peer_combine_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
+            phase: AtomicU32::new(WorkerPhase::WaitingDispatchRouteDone as u32),
+            wait_target: AtomicU32::new(0),
+            wait_observed: AtomicI64::new(0),
         })
     }
 
@@ -418,6 +511,7 @@ impl WorkerState {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Relaxed);
+        self.set_phase(WorkerPhase::Stopped);
         self.slot.stop(self.epoch.load(Ordering::Relaxed));
         self.slot.tx_ready.set(true);
     }
@@ -458,6 +552,38 @@ impl WorkerState {
 
     fn wait_imm(&self, counter: &ImmCounter, target: u32) -> bool {
         counter.wait_while(target, || self.is_running())
+    }
+
+    fn set_phase(&self, phase: WorkerPhase) {
+        self.phase.store(phase as u32, Ordering::Release);
+        self.wait_target.store(0, Ordering::Release);
+        self.wait_observed.store(0, Ordering::Release);
+    }
+
+    fn set_wait(&self, phase: WorkerPhase, target: u32, observed: i64) {
+        self.phase.store(phase as u32, Ordering::Release);
+        self.wait_target.store(target, Ordering::Release);
+        self.wait_observed.store(observed, Ordering::Release);
+    }
+
+    pub(crate) fn debug_state(&self) -> WorkerDebugState {
+        WorkerDebugState {
+            rank: self.rank,
+            slot: self.slot_idx,
+            epoch: self.epoch(),
+            phase: WorkerPhase::from_u32(self.phase.load(Ordering::Acquire)),
+            wait_target: self.wait_target.load(Ordering::Acquire),
+            wait_observed: self.wait_observed.load(Ordering::Acquire),
+            dispatch_route_done: self.slot.dispatch_route_done.get(),
+            dispatch_send_done: self.slot.dispatch_send_done.get(),
+            num_recv_tokens_ready: self.slot.num_recv_tokens_ready.get(),
+            dispatch_recv_done: self.slot.dispatch_recv_done.get(),
+            combine_send_done: self.slot.combine_send_done.get(),
+            combine_recv_done: self.slot.combine_recv_done.get(),
+            dispatch_recv_flag: self.slot.dispatch_recv_flag.is_set(),
+            combine_recv_flag: self.slot.combine_recv_flag.is_set(),
+            tx_ready: self.slot.tx_ready.is_set(),
+        }
     }
 
     pub fn epoch(&self) -> u32 {
@@ -501,6 +627,11 @@ impl WorkerState {
         let trace = std::env::var_os("PPLX_GARDEN_TRACE").is_some();
 
         // Wait for the device to copy the routing info to the host.
+        self.set_wait(
+            WorkerPhase::WaitingDispatchRouteDone,
+            epoch,
+            self.slot.dispatch_route_done.get() as i64,
+        );
         if !self.wait_epoch_trace(
             "dispatch_route_done",
             &self.slot.dispatch_route_done,
@@ -523,6 +654,11 @@ impl WorkerState {
             .unwrap();
 
         // Wait for the dispatch kernel to copy tokens into send buffers.
+        self.set_wait(
+            WorkerPhase::WaitingDispatchSendDone,
+            epoch,
+            self.slot.dispatch_send_done.get() as i64,
+        );
         if !self.wait_epoch_trace(
             "dispatch_send_done",
             &self.slot.dispatch_send_done,
@@ -535,9 +671,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch_send_done observed; tx_ready cleared",
-                self.rank,
-                self.slot_idx,
-                epoch
+                self.rank, self.slot_idx, epoch
             );
         }
         if !self.is_running() {
@@ -549,10 +683,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch_initial_routes num_private_ranges={}",
-                self.rank,
-                self.slot_idx,
-                epoch,
-                num_private_ranges
+                self.rank, self.slot_idx, epoch, num_private_ranges
             );
         }
 
@@ -570,9 +701,11 @@ impl WorkerState {
                 self.node_size
             );
         }
+        self.set_wait(WorkerPhase::WaitingRouteImm, num_dp_groups - 1, 0);
         if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
             return;
         }
+        self.set_phase(WorkerPhase::ProcessingRoute);
         let route = self.process_routing_info(epoch);
         if trace {
             eprintln!(
@@ -620,19 +753,15 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting dispatch counter target={}",
-                    self.rank,
-                    self.slot_idx,
-                    epoch,
-                    route.num_recv_tx
+                    self.rank, self.slot_idx, epoch, route.num_recv_tx
                 );
             }
+            self.set_wait(WorkerPhase::WaitingDispatchCounter, route.num_recv_tx, 0);
             self.dispatch_counter.wait(route.num_recv_tx);
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch counter observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -641,23 +770,21 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting dispatch_recv_done",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
-            if !self.wait_epoch(
-                &self.slot.dispatch_recv_done,
+            self.set_wait(
+                WorkerPhase::WaitingDispatchRecvDone,
                 epoch,
-            ) {
+                self.slot.dispatch_recv_done.get() as i64,
+            );
+            if !self.wait_epoch(&self.slot.dispatch_recv_done, epoch) {
                 return;
             }
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch_recv_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -668,16 +795,15 @@ impl WorkerState {
             self.dispatch_barrier_write_op.clone(),
             &self.dispatch_barrier_counter,
             num_dispatch_tx,
+            WorkerPhase::WaitingDispatchBarrierImm,
+            WorkerPhase::WaitingDispatchBarrierTx,
         ) {
             return;
         }
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch barrier complete num_dispatch_tx={}",
-                self.rank,
-                self.slot_idx,
-                epoch,
-                num_dispatch_tx
+                self.rank, self.slot_idx, epoch, num_dispatch_tx
             );
         }
 
@@ -693,6 +819,11 @@ impl WorkerState {
                     route.combine_ranges.len()
                 );
             }
+            self.set_wait(
+                WorkerPhase::WaitingCombineSendDone,
+                epoch,
+                self.slot.combine_send_done.get() as i64,
+            );
             if !self.wait_epoch(&self.slot.combine_send_done, epoch) {
                 return;
             }
@@ -702,9 +833,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine_send_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -731,12 +860,10 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting combine imm target={}",
-                    self.rank,
-                    self.slot_idx,
-                    epoch,
-                    num_combine_imm
+                    self.rank, self.slot_idx, epoch, num_combine_imm
                 );
             }
+            self.set_wait(WorkerPhase::WaitingCombineImm, num_combine_imm, 0);
             if !self.wait_imm(&self.combine_counter, num_combine_imm) {
                 return;
             }
@@ -744,9 +871,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine imm observed; recv flag set",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -754,20 +879,21 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting combine_recv_done",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
+            self.set_wait(
+                WorkerPhase::WaitingCombineRecvDone,
+                epoch,
+                self.slot.combine_recv_done.get() as i64,
+            );
             if !self.wait_epoch(&self.slot.combine_recv_done, epoch) {
                 return;
             }
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine_recv_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -779,17 +905,18 @@ impl WorkerState {
             self.combine_barrier_write_op.clone(),
             &self.combine_barrier_counter,
             num_combine_tx,
+            WorkerPhase::WaitingCombineBarrierImm,
+            WorkerPhase::WaitingCombineBarrierTx,
         ) {
             return;
         }
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} combine barrier complete; releasing slot",
-                self.rank,
-                self.slot_idx,
-                epoch
+                self.rank, self.slot_idx, epoch
             );
         }
+        self.set_phase(WorkerPhase::ReleasingSlot);
         self.epoch.fetch_add(1, Ordering::Release);
         self.slot_pool.release(self.slot_idx);
     }
@@ -1037,9 +1164,11 @@ impl WorkerState {
         self.slot.source_rank.copy(&source_rank);
         self.slot.source_dispatch_offset.copy(&source_dispatch_offset);
         self.slot.combine_send_offset.copy(&combine_send_offset);
-        self.slot
-            .num_recv_tokens
-            .copy(&[num_recv_tokens as u32, num_recv_efa_tokens as u32, 0]);
+        self.slot.num_recv_tokens.copy(&[
+            num_recv_tokens as u32,
+            num_recv_efa_tokens as u32,
+            0,
+        ]);
         self.slot.num_recv_tokens_ready.set(epoch);
 
         // Prepare the dispatch commands, beyond the private recv buffers.
@@ -1158,16 +1287,15 @@ impl WorkerState {
         request: TransferRequest,
         imm_counter: &ImmCounter,
         num_tx: u32,
+        wait_imm_phase: WorkerPhase,
+        wait_tx_phase: WorkerPhase,
     ) -> bool {
         let barrier = range_start!("barrier");
         let trace = std::env::var_os("PPLX_GARDEN_TRACE").is_some();
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} submitting num_tx={}",
-                self.rank,
-                self.slot_idx,
-                label,
-                num_tx
+                self.rank, self.slot_idx, label, num_tx
             );
         }
 
@@ -1189,6 +1317,7 @@ impl WorkerState {
                 self.world_size - 1
             );
         }
+        self.set_wait(wait_imm_phase, (self.world_size - 1) as u32, 0);
         if !self.wait_imm(imm_counter, (self.world_size - 1) as u32) {
             range_end!(barrier);
             return false;
@@ -1196,9 +1325,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} imm observed",
-                self.rank,
-                self.slot_idx,
-                label
+                self.rank, self.slot_idx, label
             );
         }
 
@@ -1208,13 +1335,10 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} waiting tx_counter old={} subtract={}",
-                self.rank,
-                self.slot_idx,
-                label,
-                old,
-                num_tx_total
+                self.rank, self.slot_idx, label, old, num_tx_total
             );
         }
+        self.set_wait(wait_tx_phase, num_tx_total as u32, old);
         if old < num_tx_total {
             while self.tx_counter.load(Ordering::Relaxed) < 0 {
                 if !self.is_running() {
@@ -1228,9 +1352,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} tx_ready set",
-                self.rank,
-                self.slot_idx,
-                label
+                self.rank, self.slot_idx, label
             );
         }
 
