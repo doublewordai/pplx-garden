@@ -453,6 +453,22 @@ def _test_p2p_all_to_all_worker(
                 slot_key=0,
             )
             assert ll_dispatch_handle_reuse._slot == 0
+            assert _ll_expert_x_reuse.data_ptr() == ll_expert_x.data_ptr()
+            if ll_expert_x_scale is None:
+                assert _ll_expert_x_scale_reuse is None
+            else:
+                assert _ll_expert_x_scale_reuse is not None
+                assert (
+                    _ll_expert_x_scale_reuse.data_ptr()
+                    == ll_expert_x_scale.data_ptr()
+                )
+            if ll_expert_x.dtype == out_dtype:
+                ll_combine_buffer_reuse = (
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle_reuse
+                    )
+                )
+                assert ll_combine_buffer_reuse.data_ptr() == ll_expert_x.data_ptr()
             ll_dispatch_recv_reuse()
             _ll_combine_handle_reuse, ll_combine_recv_reuse = (
                 all_to_all.low_latency_combine(
