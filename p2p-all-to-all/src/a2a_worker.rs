@@ -45,6 +45,10 @@ fn compute_padded_offsets(
     padded_offset
 }
 
+fn pack_layout_range(count: u32, offset: u32) -> u64 {
+    (count as u64) | ((offset as u64) << 32)
+}
+
 #[derive(Debug, PartialEq)]
 struct ReceiveRoutePlan {
     tokens_from_group: Vec<u32>,
@@ -60,6 +64,7 @@ struct ReceiveRoutePlan {
     padded_index: Vec<u32>,
     tokens_to_rank: Vec<u32>,
     dispatch_src_offset: Vec<u32>,
+    layout_range: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +75,7 @@ pub struct LowLatencyRouteLayoutPlan {
     pub final_index: Vec<u32>,
     pub tokens_per_source_group_per_local_expert: Vec<Vec<u32>>,
     pub tokens_per_expert: Vec<u32>,
+    pub layout_range: Vec<u64>,
     pub num_recv_tokens: usize,
 }
 
@@ -215,6 +221,7 @@ fn compute_receive_route_plan(
     let mut combine_send_offset = vec![0; num_recv_tokens];
     let mut source_rank = vec![0; num_recv_tokens];
     let mut padded_index = vec![0u32; num_recv_tokens];
+    let mut layout_range = vec![0u64; num_local_experts * num_dp_groups];
 
     let mut last = 0;
     let mut src_dispatch_count = vec![0; num_dp_groups];
@@ -229,6 +236,8 @@ fn compute_receive_route_plan(
             num_routed += routed as usize;
 
             let local_expert = expert - first_local_expert;
+            layout_range[local_expert * num_dp_groups + peer_group] =
+                pack_layout_range(routed, expert_count[local_expert] as u32);
             let src_offset = src_group_offset[peer_group];
             let dst_offset = dst_group_offset[peer_group];
             let peer_rank = peer_group * dp_size + dp_rank;
@@ -301,6 +310,7 @@ fn compute_receive_route_plan(
         padded_index,
         tokens_to_rank,
         dispatch_src_offset,
+        layout_range,
     }
 }
 
@@ -394,6 +404,7 @@ pub(crate) fn compute_low_latency_route_layout_plan(
         final_index: plan.padded_index,
         tokens_per_source_group_per_local_expert,
         tokens_per_expert: plan.tokens_per_expert,
+        layout_range: plan.layout_range,
         num_recv_tokens: plan.num_recv_tokens,
     }
 }
@@ -946,8 +957,9 @@ impl WorkerState {
         let num_dp_groups = self.world_size / self.dp_size;
         for peer_group in 0..num_dp_groups {
             let peer_rank = peer_group * self.dp_size + self.dp_rank;
-            let peer_epoch =
-                unsafe { AtomicU32::from_ptr(self.node_route_epoch_ptrs[peer_rank] as *mut u32) };
+            let peer_epoch = unsafe {
+                AtomicU32::from_ptr(self.node_route_epoch_ptrs[peer_rank] as *mut u32)
+            };
             while peer_epoch.load(Ordering::Acquire) != epoch {
                 if !self.is_running() {
                     return false;
@@ -1704,6 +1716,19 @@ mod tests {
             vec![6, 7, 8, 9, 10, 11, 12, 0, 1, 2, 0, 1, 2]
         );
         assert_eq!(plan.padded_index, vec![0, 1, 8, 9, 10, 11, 12, 2, 3, 4, 5, 13, 14]);
+        assert_eq!(
+            plan.layout_range,
+            vec![
+                super::pack_layout_range(1, 5),
+                super::pack_layout_range(3, 2),
+                super::pack_layout_range(2, 0),
+                super::pack_layout_range(0, 2),
+                super::pack_layout_range(2, 5),
+                super::pack_layout_range(0, 5),
+                super::pack_layout_range(1, 0),
+                super::pack_layout_range(4, 1),
+            ]
+        );
 
         assert_eq!(
             compute_initial_dispatch_transfer_plans(

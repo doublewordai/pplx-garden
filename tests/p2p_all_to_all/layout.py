@@ -34,6 +34,10 @@ def _ordered_source_groups(
     return source_groups
 
 
+def _pack_layout_range(count: int, offset: int) -> int:
+    return count | (offset << 32)
+
+
 def expected_canonical_batched_experts_route_plan(
     *,
     rank_data: list[RankTestData],
@@ -69,12 +73,17 @@ def expected_canonical_batched_experts_route_plan(
     source_group: list[int] = []
     final_index: list[int] = []
     tokens_per_expert = [0 for _ in range(num_local_experts)]
+    num_source_groups = len(rank_data)
+    layout_range = [0 for _ in range(num_local_experts * num_source_groups)]
     for route_source_group in source_group_order:
         route_source_rank = route_source_group * dp_size + rank % dp_size
         for local_expert in range(num_local_experts):
             count = tokens_per_source_group_per_local_expert[
                 route_source_group
             ][local_expert]
+            layout_range[local_expert * num_source_groups + route_source_group] = (
+                _pack_layout_range(count, tokens_per_expert[local_expert])
+            )
             for _ in range(count):
                 source_rank.append(route_source_rank)
                 source_group.append(route_source_group)
@@ -93,6 +102,7 @@ def expected_canonical_batched_experts_route_plan(
             tokens_per_source_group_per_local_expert
         ),
         "tokens_per_expert": tokens_per_expert,
+        "layout_range": layout_range,
         "num_recv_tokens": len(final_index),
     }
 
