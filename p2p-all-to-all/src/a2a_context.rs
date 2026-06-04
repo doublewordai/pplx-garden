@@ -87,6 +87,8 @@ struct DeviceWorkspace {
     expert_offsets: CudaDeviceMemory,
     /// The offset of the token within the expert group.
     token_offset: CudaDeviceMemory,
+    /// Source-rank local `(token, topk)` to combine receive-buffer position.
+    combine_recv_position: CudaDeviceMemory,
     /// Counter for the number of tokens sent during combine.
     token_counter: CudaDeviceMemory,
     /// Completion counter for dispatch-send.
@@ -121,6 +123,9 @@ impl DeviceWorkspace {
         expert_offsets.zero();
 
         let token_offset = CudaDeviceMemory::device(
+            max_num_tokens * num_experts_per_token * std::mem::size_of::<u32>(),
+        )?;
+        let combine_recv_position = CudaDeviceMemory::device(
             max_num_tokens * num_experts_per_token * std::mem::size_of::<u32>(),
         )?;
 
@@ -158,6 +163,7 @@ impl DeviceWorkspace {
         Ok(Self {
             expert_offsets,
             token_offset,
+            combine_recv_position,
             token_counter,
             dispatch_send_counter,
             dispatch_recv_counter,
@@ -764,7 +770,7 @@ impl AllToAllContext {
             workspace.token_offset.get_mut_ptr(),
             worker.buffers.num_routed_ptr,
             workspace.expert_offsets.get_mut_ptr(),
-            worker.slot.combine_recv_position.get_device_ptr(),
+            workspace.combine_recv_position.get_mut_ptr(),
             worker.slot.dispatch_route_done.get_device_ptr(),
             worker.slot.dispatch_send_done.get_device_ptr(),
             worker.slot.tx_ready.get_device_ptr(),
@@ -1037,7 +1043,7 @@ impl AllToAllContext {
             worker.buffers.recv_buffer_ptr as *mut u8,
             workspace.token_offset.get_mut_ptr(),
             workspace.expert_offsets.get_mut_ptr(),
-            worker.slot.combine_recv_position.get_device_ptr(),
+            workspace.combine_recv_position.get_mut_ptr(),
             worker.slot.combine_recv_flag.get_device_ptr(),
             worker.slot.combine_recv_done.get_device_ptr(),
             workspace.sync_counter.get_mut_ptr(),
