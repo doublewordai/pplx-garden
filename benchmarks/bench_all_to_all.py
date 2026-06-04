@@ -19,6 +19,18 @@ from tests.p2p_all_to_all.data import RankTestData
 logger = logging_utils.get_logger("bench_all_to_all")
 
 
+def optional_int(value: str) -> Optional[int]:
+    if value.lower() in ("none", "null"):
+        return None
+    return int(value)
+
+
+def optional_dtype(value: str) -> Optional[torch.dtype]:
+    if value.lower() in ("none", "null"):
+        return None
+    return str_to_dtype(value)
+
+
 def rand_topk_idx(
     num_tokens: int,
     num_experts: int,
@@ -711,11 +723,11 @@ def main() -> None:
     parser.add_argument("--max-private-tokens", type=optional_int, default=256)
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=7168)
-    parser.add_argument("--hidden-dim-scale", type=int, default=56)
+    parser.add_argument("--hidden-dim-scale", type=optional_int, default=56)
     parser.add_argument("--num-experts-per-token", type=int, default=8)
     parser.add_argument("--in-dtype", type=str_to_dtype, default=torch.float8_e4m3fn)
     parser.add_argument("--out-dtype", type=str_to_dtype, default=torch.bfloat16)
-    parser.add_argument("--scale-dtype", type=str_to_dtype, default=torch.float32)
+    parser.add_argument("--scale-dtype", type=optional_dtype, default=torch.float32)
     parser.add_argument("--nvlink", type=int, default=None)
     parser.add_argument("--output", type=Path, default=Path("/dev/stdout"))
     parser.add_argument(
