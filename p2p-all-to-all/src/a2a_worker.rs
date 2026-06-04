@@ -339,6 +339,58 @@ fn ordered_source_groups(
     source_groups
 }
 
+#[allow(dead_code, clippy::too_many_arguments)]
+fn low_latency_final_batched_expert_index(
+    source_group: usize,
+    expert: usize,
+    token_offset_in_source_expert: u32,
+    dp_group: usize,
+    dp_rank: usize,
+    dp_size: usize,
+    node_size: usize,
+    world_size: usize,
+    num_experts: usize,
+    expert_padding: usize,
+    max_tokens_per_expert: usize,
+    mut get_num_routed: impl FnMut(usize, usize) -> u32,
+) -> u32 {
+    let num_dp_groups = world_size / dp_size;
+    let experts_per_rank = num_experts.div_ceil(num_dp_groups);
+    let first_local_expert = dp_group * experts_per_rank;
+    let last_local_expert = (first_local_expert + experts_per_rank).min(num_experts);
+    assert!((first_local_expert..last_local_expert).contains(&expert));
+
+    let rank = dp_group * dp_size + dp_rank;
+    let rank_node = rank / node_size;
+    let groups_per_node = node_size / dp_size;
+    let num_nodes = world_size / node_size;
+    let local_expert = expert - first_local_expert;
+
+    let expert_base = if max_tokens_per_expert > 0 {
+        local_expert * max_tokens_per_expert
+    } else {
+        let mut base = 0usize;
+        for prior_expert in first_local_expert..expert {
+            let tokens = (0..num_dp_groups)
+                .map(|group| get_num_routed(group, prior_expert) as usize)
+                .sum::<usize>();
+            base += tokens.div_ceil(expert_padding) * expert_padding;
+        }
+        base
+    };
+
+    let mut source_group_offset = 0u32;
+    for group in ordered_source_groups(dp_group, rank_node, groups_per_node, num_nodes)
+    {
+        if group == source_group {
+            break;
+        }
+        source_group_offset += get_num_routed(group, expert);
+    }
+
+    expert_base as u32 + source_group_offset + token_offset_in_source_expert
+}
+
 fn unpack_layout_range_offset(packed: u64) -> u32 {
     (packed >> 32) as u32
 }
@@ -1900,5 +1952,30 @@ mod tests {
             ]
         );
         assert_eq!(plan.num_recv_tokens, 13);
+
+        let mut final_indices_from_route_offsets = Vec::new();
+        for source_group in [2, 3, 1, 0] {
+            for expert in 0..2 {
+                for token_offset in 0..num_routed[source_group][expert] {
+                    final_indices_from_route_offsets.push(
+                        super::low_latency_final_batched_expert_index(
+                            source_group,
+                            expert,
+                            token_offset,
+                            0,
+                            0,
+                            1,
+                            2,
+                            4,
+                            8,
+                            1,
+                            8,
+                            |dp_group, expert| num_routed[dp_group][expert],
+                        ),
+                    );
+                }
+            }
+        }
+        assert_eq!(final_indices_from_route_offsets, plan.final_index);
     }
 }
