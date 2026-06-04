@@ -40,6 +40,7 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ source_offset,
     uint32_t * __restrict__ padded_index,
     uint32_t * __restrict__ source_token_index,
+    uint32_t * __restrict__ source_route_index,
     uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ num_recv_tokens_ptr,
     uint32_t * __restrict__ num_recv_tokens_ready,
@@ -147,9 +148,12 @@ void a2a_dispatch_recv_kernel(
         }
 
         // Token originates from the local node - copy it from an NVLink buffer.
-        auto source_token = *(uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+        auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+        auto source_token = source_route_info[0];
+        auto source_route = source_route_info[1];
         if (threadIdx.x == 0) {
             source_token_index[padded_token] = source_token;
+            source_route_index[padded_token] = source_route;
         }
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
         float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
@@ -214,7 +218,9 @@ void a2a_dispatch_recv_kernel(
             if (threadIdx.x == 0) {
                 auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
                 auto source_token = source_route_info[0];
+                auto source_route = source_route_info[1];
                 source_token_index[local_stage[s].dst_index] = source_token;
+                source_route_index[local_stage[s].dst_index] = source_route;
             }
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
@@ -277,6 +283,7 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t *source_offset,
     uint32_t *padded_index,
     uint32_t *source_token_index,
+    uint32_t *source_route_index,
     uint32_t *num_routed,
     uint32_t *num_recv_tokens_ptr,
     uint32_t *num_recv_tokens_ready,
@@ -324,6 +331,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &source_offset,
         &padded_index,
         &source_token_index,
+        &source_route_index,
         &num_routed,
         &num_recv_tokens_ptr,
         &num_recv_tokens_ready,

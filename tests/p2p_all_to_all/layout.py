@@ -73,6 +73,7 @@ def expected_canonical_batched_experts_route_plan(
     source_group: list[int] = []
     final_index: list[int] = []
     source_token_index: list[int] = []
+    source_route_index: list[int] = []
     tokens_per_expert = [0 for _ in range(num_local_experts)]
     num_source_groups = len(rank_data)
     layout_range = [0 for _ in range(num_local_experts * num_source_groups)]
@@ -105,6 +106,7 @@ def expected_canonical_batched_experts_route_plan(
                         + tokens_per_expert[local_expert]
                     )
                     source_token_index.append(token_idx)
+                    source_route_index.append(topk_idx)
                     tokens_per_expert[local_expert] += 1
 
     return {
@@ -113,6 +115,7 @@ def expected_canonical_batched_experts_route_plan(
         "source_group": source_group,
         "final_index": final_index,
         "source_token_index": source_token_index,
+        "source_route_index": source_route_index,
         "tokens_per_source_group_per_local_expert": (
             tokens_per_source_group_per_local_expert
         ),
