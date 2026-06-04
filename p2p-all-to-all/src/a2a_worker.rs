@@ -576,6 +576,7 @@ pub(crate) struct MicrobatchSlot {
     pub(crate) combine_send_offset: GdrVec<u32>,
     pub(crate) source_rank: GdrVec<u32>,
     pub(crate) padded_index: GdrVec<u32>,
+    pub(crate) layout_range: GdrVec<u64>,
     pub(crate) num_recv_tokens: GdrVec<u32>,
     pub(crate) num_recv_tokens_ready: GdrEpoch,
     pub(crate) tx_ready: GdrFlag,
@@ -587,6 +588,7 @@ impl MicrobatchSlot {
     fn new(
         gdr_context: &GdrCopyContext,
         num_local_experts: usize,
+        num_ep_groups: usize,
         max_recv_tokens: usize,
     ) -> Result<Self> {
         let dispatch_route_done = GdrEpoch::new(gdr_context)?;
@@ -604,6 +606,7 @@ impl MicrobatchSlot {
         let source_dispatch_offset = GdrVec::new(gdr_context, max_recv_tokens)?;
         let combine_send_offset = GdrVec::new(gdr_context, max_recv_tokens)?;
         let padded_index = GdrVec::new(gdr_context, max_recv_tokens)?;
+        let layout_range = GdrVec::new(gdr_context, num_local_experts * num_ep_groups)?;
         let num_recv_tokens = GdrVec::new(gdr_context, 3)?;
 
         num_recv_tokens.copy(&[0u32, 0u32, 0u32]);
@@ -628,6 +631,7 @@ impl MicrobatchSlot {
             combine_send_offset,
             source_rank,
             padded_index,
+            layout_range,
             num_recv_tokens,
             num_recv_tokens_ready,
             tx_ready,
@@ -757,12 +761,17 @@ impl WorkerState {
     ) -> Result<Self> {
         let dp_rank = rank % dp_size;
         let dp_group = rank / dp_size;
-        let num_local_experts = num_experts.div_ceil(world_size / dp_size);
+        let num_ep_groups = world_size / dp_size;
+        let num_local_experts = num_experts.div_ceil(num_ep_groups);
 
         let gdr_context = GdrCopyContext::new()?;
 
-        let slot =
-            MicrobatchSlot::new(&gdr_context, num_local_experts, max_recv_tokens)?;
+        let slot = MicrobatchSlot::new(
+            &gdr_context,
+            num_local_experts,
+            num_ep_groups,
+            max_recv_tokens,
+        )?;
         // Set up the immediate counters.
         let route_imm = imm_base;
         let route_counter = transfer_engine.get_imm_counter(route_imm);
@@ -1461,6 +1470,7 @@ impl WorkerState {
         self.slot.source_rank.copy(&plan.source_rank);
         self.slot.source_dispatch_offset.copy(&plan.source_dispatch_offset);
         self.slot.combine_send_offset.copy(&plan.combine_send_offset);
+        self.slot.layout_range.copy(&plan.layout_range);
         self.slot.num_recv_tokens.copy(&[
             plan.num_recv_tokens as u32,
             plan.num_recv_efa_tokens as u32,

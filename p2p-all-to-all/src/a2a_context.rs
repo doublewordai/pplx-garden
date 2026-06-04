@@ -1206,9 +1206,7 @@ impl AllToAllContext {
     }
 
     pub fn uses_node_route_exchange(&self) -> bool {
-        self.workers
-            .first()
-            .is_some_and(|worker| worker.has_node_route_exchange())
+        self.workers.first().is_some_and(|worker| worker.has_node_route_exchange())
     }
 
     pub fn debug_low_latency_route_layout_plan(
@@ -1236,7 +1234,7 @@ impl AllToAllContext {
 
         let dp_group = self.rank / self.dp_size;
         let dp_rank = self.rank % self.dp_size;
-        Ok(compute_low_latency_route_layout_plan(
+        let plan = compute_low_latency_route_layout_plan(
             dp_group,
             dp_rank,
             self.dp_size,
@@ -1248,7 +1246,8 @@ impl AllToAllContext {
             self.max_private_tokens,
             1,
             |source_group, expert| num_routed[source_group][expert],
-        ))
+        );
+        Ok(plan)
     }
 
     pub fn debug_low_latency_route_layout_plan_for_handle(
@@ -1261,7 +1260,7 @@ impl AllToAllContext {
         let num_ep_groups = self.world_size / self.dp_size;
         let dp_group = self.rank / self.dp_size;
         let dp_rank = self.rank % self.dp_size;
-        Ok(compute_low_latency_route_layout_plan(
+        let mut plan = compute_low_latency_route_layout_plan(
             dp_group,
             dp_rank,
             self.dp_size,
@@ -1276,7 +1275,11 @@ impl AllToAllContext {
                 debug_assert!(source_group < num_ep_groups);
                 worker.get_num_routed(source_group, expert)
             },
-        ))
+        );
+        plan.layout_range = (0..plan.layout_range.len())
+            .map(|index| worker.slot.layout_range.get(index))
+            .collect();
+        Ok(plan)
     }
 }
 
