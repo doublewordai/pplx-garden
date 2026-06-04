@@ -22,6 +22,7 @@ use crate::{
     a2a_worker::{
         LowLatencyRouteLayoutPlan, SlotPool, WorkerState,
         compute_low_latency_route_layout_plan,
+        source_group_expert_offsets_from_layout_range,
     },
 };
 
@@ -1284,6 +1285,12 @@ impl AllToAllContext {
         plan.layout_range = (0..plan.layout_range.len())
             .map(|index| worker.slot.layout_range.get(index))
             .collect();
+        plan.source_group_expert_offsets =
+            source_group_expert_offsets_from_layout_range(
+                &plan.layout_range,
+                num_ep_groups,
+                self.num_experts.div_ceil(num_ep_groups),
+            );
         plan.source_token_index = plan
             .final_index
             .iter()

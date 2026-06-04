@@ -75,6 +75,7 @@ pub struct LowLatencyRouteLayoutPlan {
     pub final_index: Vec<u32>,
     pub source_token_index: Vec<u32>,
     pub tokens_per_source_group_per_local_expert: Vec<Vec<u32>>,
+    pub source_group_expert_offsets: Vec<Vec<u32>>,
     pub tokens_per_expert: Vec<u32>,
     pub layout_range: Vec<u64>,
     pub num_recv_tokens: usize,
@@ -338,6 +339,26 @@ fn ordered_source_groups(
     source_groups
 }
 
+fn unpack_layout_range_offset(packed: u64) -> u32 {
+    (packed >> 32) as u32
+}
+
+pub(crate) fn source_group_expert_offsets_from_layout_range(
+    layout_range: &[u64],
+    num_source_groups: usize,
+    num_local_experts: usize,
+) -> Vec<Vec<u32>> {
+    let mut offsets = vec![vec![0; num_local_experts]; num_source_groups];
+    for (source_group, row) in offsets.iter_mut().enumerate() {
+        for (local_expert, offset) in row.iter_mut().enumerate() {
+            *offset = unpack_layout_range_offset(
+                layout_range[local_expert * num_source_groups + source_group],
+            );
+        }
+    }
+    offsets
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_low_latency_route_layout_plan(
     dp_group: usize,
@@ -390,6 +411,11 @@ pub(crate) fn compute_low_latency_route_layout_plan(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let source_group_expert_offsets = source_group_expert_offsets_from_layout_range(
+        &plan.layout_range,
+        num_dp_groups,
+        last_local_expert - first_local_expert,
+    );
 
     LowLatencyRouteLayoutPlan {
         source_group_order: source_group_order
@@ -405,6 +431,7 @@ pub(crate) fn compute_low_latency_route_layout_plan(
         final_index: plan.padded_index,
         source_token_index: Vec::new(),
         tokens_per_source_group_per_local_expert,
+        source_group_expert_offsets,
         tokens_per_expert: plan.tokens_per_expert,
         layout_range: plan.layout_range,
         num_recv_tokens: plan.num_recv_tokens,
@@ -1853,6 +1880,10 @@ mod tests {
         assert_eq!(
             plan.tokens_per_source_group_per_local_expert,
             vec![vec![1, 2], vec![3, 0], vec![2, 1], vec![0, 4]]
+        );
+        assert_eq!(
+            plan.source_group_expert_offsets,
+            vec![vec![5, 5], vec![2, 5], vec![0, 0], vec![2, 1]]
         );
         assert_eq!(plan.tokens_per_expert, vec![6, 7]);
         assert_eq!(

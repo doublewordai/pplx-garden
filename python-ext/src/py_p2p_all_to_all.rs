@@ -28,6 +28,7 @@ fn low_latency_route_layout_plan_to_dict<'py>(
         "tokens_per_source_group_per_local_expert",
         plan.tokens_per_source_group_per_local_expert,
     )?;
+    dict.set_item("source_group_expert_offsets", plan.source_group_expert_offsets)?;
     dict.set_item("tokens_per_expert", plan.tokens_per_expert)?;
     dict.set_item("layout_range", plan.layout_range)?;
     dict.set_item("num_recv_tokens", plan.num_recv_tokens)?;
