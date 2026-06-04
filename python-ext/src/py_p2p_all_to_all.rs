@@ -235,6 +235,30 @@ impl PyAllToAllContext {
         dict.set_item("tensors", tensors)?;
         Ok(dict)
     }
+
+    fn debug_low_latency_route_layout_plan<'py>(
+        &self,
+        py: Python<'py>,
+        num_routed: Vec<Vec<u32>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let plan = self
+            .ctx
+            .debug_low_latency_route_layout_plan(num_routed)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let dict = PyDict::new(py);
+        dict.set_item("source_group_order", plan.source_group_order)?;
+        dict.set_item("source_rank", plan.source_rank)?;
+        dict.set_item("source_group", plan.source_group)?;
+        dict.set_item("final_index", plan.final_index)?;
+        dict.set_item(
+            "tokens_per_source_group_per_local_expert",
+            plan.tokens_per_source_group_per_local_expert,
+        )?;
+        dict.set_item("tokens_per_expert", plan.tokens_per_expert)?;
+        dict.set_item("num_recv_tokens", plan.num_recv_tokens)?;
+        Ok(dict)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_recv(
         &mut self,

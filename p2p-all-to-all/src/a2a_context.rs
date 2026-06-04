@@ -19,7 +19,10 @@ use torch_lib::ScalarType;
 
 use crate::{
     a2a_handles::AllToAllRankHandle,
-    a2a_worker::{SlotPool, WorkerState},
+    a2a_worker::{
+        LowLatencyRouteLayoutPlan, SlotPool, WorkerState,
+        compute_low_latency_route_layout_plan,
+    },
 };
 
 const LOW_LATENCY_WORKSPACE_ALIGNMENT: usize = 256;
@@ -1121,6 +1124,46 @@ impl AllToAllContext {
             }
         }
         stats
+    }
+
+    pub fn debug_low_latency_route_layout_plan(
+        &self,
+        num_routed: Vec<Vec<u32>>,
+    ) -> Result<LowLatencyRouteLayoutPlan> {
+        let num_ep_groups = self.world_size / self.dp_size;
+        if num_routed.len() != num_ep_groups {
+            return Err(anyhow!(
+                "Expected {} source-group route rows, got {}",
+                num_ep_groups,
+                num_routed.len()
+            ));
+        }
+        for (source_group, counts) in num_routed.iter().enumerate() {
+            if counts.len() != self.num_experts {
+                return Err(anyhow!(
+                    "Expected {} expert counts for source group {}, got {}",
+                    self.num_experts,
+                    source_group,
+                    counts.len()
+                ));
+            }
+        }
+
+        let dp_group = self.rank / self.dp_size;
+        let dp_rank = self.rank % self.dp_size;
+        Ok(compute_low_latency_route_layout_plan(
+            dp_group,
+            dp_rank,
+            self.dp_size,
+            self.node_size,
+            self.world_size,
+            self.num_experts,
+            1,
+            self.max_tokens_per_expert,
+            self.max_private_tokens,
+            1,
+            |source_group, expert| num_routed[source_group][expert],
+        ))
     }
 }
 

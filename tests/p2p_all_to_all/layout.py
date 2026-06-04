@@ -34,6 +34,69 @@ def _ordered_source_groups(
     return source_groups
 
 
+def expected_canonical_batched_experts_route_plan(
+    *,
+    rank_data: list[RankTestData],
+    first_expert: int,
+    num_local_experts: int,
+    rank: int,
+    dp_size: int,
+    node_size: int,
+    world_size: int,
+    max_tokens_per_expert: int,
+) -> dict[str, list[int] | list[list[int]] | int]:
+    """Return the canonical source order and flat BatchedExperts indices."""
+
+    source_group_order = _ordered_source_groups(
+        rank=rank,
+        dp_size=dp_size,
+        node_size=node_size,
+        world_size=world_size,
+    )
+    tokens_per_source_group_per_local_expert = [
+        [
+            int(
+                rank_data[source_group]
+                .expected_num_tokens[first_expert + local_expert]
+                .item()
+            )
+            for local_expert in range(num_local_experts)
+        ]
+        for source_group in range(len(rank_data))
+    ]
+
+    source_rank: list[int] = []
+    source_group: list[int] = []
+    final_index: list[int] = []
+    tokens_per_expert = [0 for _ in range(num_local_experts)]
+    for route_source_group in source_group_order:
+        route_source_rank = route_source_group * dp_size + rank % dp_size
+        for local_expert in range(num_local_experts):
+            count = tokens_per_source_group_per_local_expert[
+                route_source_group
+            ][local_expert]
+            for _ in range(count):
+                source_rank.append(route_source_rank)
+                source_group.append(route_source_group)
+                final_index.append(
+                    local_expert * max_tokens_per_expert
+                    + tokens_per_expert[local_expert]
+                )
+                tokens_per_expert[local_expert] += 1
+
+    return {
+        "source_group_order": source_group_order,
+        "source_rank": source_rank,
+        "source_group": source_group,
+        "final_index": final_index,
+        "tokens_per_source_group_per_local_expert": (
+            tokens_per_source_group_per_local_expert
+        ),
+        "tokens_per_expert": tokens_per_expert,
+        "num_recv_tokens": len(final_index),
+    }
+
+
 def assert_canonical_batched_experts_layout(
     *,
     out_expert_x: torch.Tensor,

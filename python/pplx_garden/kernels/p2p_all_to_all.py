@@ -1337,6 +1337,21 @@ class P2PAllToAll(AllToAllKernel):
             return {}
         return self._all_to_all.get_perf_stats()
 
+    def debug_low_latency_route_layout_plan(
+        self,
+        num_routed: list[list[int]],
+    ) -> dict[str, Any]:
+        """Return the native low-latency route layout for tests/audits.
+
+        This is the Stage 1 contract surface: it exposes the same route plan
+        that the worker uses to publish source ranks and final BatchedExperts
+        indices, without launching extra hot-path CUDA work.
+        """
+
+        if self._all_to_all is None:
+            return {}
+        return self._all_to_all.debug_low_latency_route_layout_plan(num_routed)
+
     @override
     def destroy(self) -> None:
         """Clean up the all-to-all context."""

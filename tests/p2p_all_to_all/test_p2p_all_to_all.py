@@ -22,7 +22,10 @@ from tests.markers import (
     mark_kernel,
 )
 from tests.p2p_all_to_all.data import RankTestData
-from tests.p2p_all_to_all.layout import assert_canonical_batched_experts_layout
+from tests.p2p_all_to_all.layout import (
+    assert_canonical_batched_experts_layout,
+    expected_canonical_batched_experts_route_plan,
+)
 
 logger = logging_utils.get_logger(__name__)
 
@@ -301,6 +304,28 @@ def _test_p2p_all_to_all_worker(
                 expert_padding=config.expert_padding,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
+            native_route_plan = all_to_all.debug_low_latency_route_layout_plan(
+                [
+                    [
+                        int(data.expected_num_tokens[expert].item())
+                        for expert in range(num_experts)
+                    ]
+                    for data in rank_data
+                ]
+            )
+            expected_route_plan = expected_canonical_batched_experts_route_plan(
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            assert native_route_plan == expected_route_plan
             if ll_expert_x.dtype == out_dtype:
                 ll_combine_buffer = (
                     all_to_all.get_next_low_latency_combine_buffer(

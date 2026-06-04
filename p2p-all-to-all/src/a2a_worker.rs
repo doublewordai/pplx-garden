@@ -62,6 +62,17 @@ struct ReceiveRoutePlan {
     dispatch_src_offset: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LowLatencyRouteLayoutPlan {
+    pub source_group_order: Vec<u32>,
+    pub source_rank: Vec<u32>,
+    pub source_group: Vec<u32>,
+    pub final_index: Vec<u32>,
+    pub tokens_per_source_group_per_local_expert: Vec<Vec<u32>>,
+    pub tokens_per_expert: Vec<u32>,
+    pub num_recv_tokens: usize,
+}
+
 #[derive(Debug, PartialEq)]
 struct RemoteTransferPlan {
     peer_rank: usize,
@@ -290,6 +301,100 @@ fn compute_receive_route_plan(
         padded_index,
         tokens_to_rank,
         dispatch_src_offset,
+    }
+}
+
+fn ordered_source_groups(
+    dp_group: usize,
+    rank_node: usize,
+    groups_per_node: usize,
+    num_nodes: usize,
+) -> Vec<usize> {
+    let mut source_groups = Vec::new();
+    for node_offset in 1..num_nodes {
+        let node = (rank_node + node_offset) % num_nodes;
+        for group_in_node in 0..groups_per_node {
+            source_groups.push(node * groups_per_node + group_in_node);
+        }
+    }
+    for local_group_offset in 1..groups_per_node {
+        source_groups.push(
+            rank_node * groups_per_node
+                + (dp_group + local_group_offset) % groups_per_node,
+        );
+    }
+    source_groups.push(dp_group);
+    source_groups
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_low_latency_route_layout_plan(
+    dp_group: usize,
+    dp_rank: usize,
+    dp_size: usize,
+    node_size: usize,
+    world_size: usize,
+    num_experts: usize,
+    expert_padding: usize,
+    max_tokens_per_expert: usize,
+    max_private_tokens: usize,
+    nets_per_gpu: u32,
+    mut get_num_routed: impl FnMut(usize, usize) -> u32,
+) -> LowLatencyRouteLayoutPlan {
+    let num_dp_groups = world_size / dp_size;
+    let experts_per_rank = num_experts.div_ceil(num_dp_groups);
+    let first_local_expert = dp_group * experts_per_rank;
+    let last_local_expert = (first_local_expert + experts_per_rank).min(num_experts);
+    let rank = dp_group * dp_size + dp_rank;
+    let rank_node = rank / node_size;
+    let groups_per_node = node_size / dp_size;
+    let num_nodes = world_size / node_size;
+
+    let mut num_routed = vec![vec![0u32; num_experts]; num_dp_groups];
+    for (source_group, row) in num_routed.iter_mut().enumerate() {
+        for (expert, count) in row.iter_mut().enumerate() {
+            *count = get_num_routed(source_group, expert);
+        }
+    }
+
+    let plan = compute_receive_route_plan(
+        dp_group,
+        dp_rank,
+        dp_size,
+        node_size,
+        world_size,
+        num_experts,
+        expert_padding,
+        max_tokens_per_expert,
+        max_private_tokens,
+        nets_per_gpu,
+        |source_group, expert| num_routed[source_group][expert],
+    );
+    let source_group_order =
+        ordered_source_groups(dp_group, rank_node, groups_per_node, num_nodes);
+    let tokens_per_source_group_per_local_expert = (0..num_dp_groups)
+        .map(|source_group| {
+            (first_local_expert..last_local_expert)
+                .map(|expert| num_routed[source_group][expert])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    LowLatencyRouteLayoutPlan {
+        source_group_order: source_group_order
+            .into_iter()
+            .map(|source_group| source_group as u32)
+            .collect(),
+        source_group: plan
+            .source_rank
+            .iter()
+            .map(|rank| *rank / dp_size as u32)
+            .collect(),
+        source_rank: plan.source_rank,
+        final_index: plan.padded_index,
+        tokens_per_source_group_per_local_expert,
+        tokens_per_expert: plan.tokens_per_expert,
+        num_recv_tokens: plan.num_recv_tokens,
     }
 }
 
