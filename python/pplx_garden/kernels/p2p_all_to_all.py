@@ -62,6 +62,16 @@ class _NVLRankMapping:
 
 
 @dataclass
+class _LowLatencyWorkspaceRankData:
+    workspace_fds: list[CUMemExportHandle]
+
+
+@dataclass
+class _LowLatencyWorkspacePeerMapping:
+    workspace_mapping: CUMemMapping
+
+
+@dataclass
 class _NodeRouteShmData:
     names: list[str]
     sizes: list[int]
@@ -103,8 +113,9 @@ class _LowLatencyWorkspaceLease:
 class _LowLatencyWorkspacePool:
     """Preallocated low-latency dispatch workspaces, keyed by microbatch slot."""
 
-    def __init__(self) -> None:
+    def __init__(self, handle_kind: CUMemHandleKind) -> None:
         self._entries: dict[int, _LowLatencyWorkspaceEntry] = {}
+        self._handle_kind = handle_kind
 
     def _layout_offsets(
         self,
@@ -169,9 +180,7 @@ class _LowLatencyWorkspacePool:
                     f"current={current_bytes}"
                 )
             capacity_bytes = round_up(total_bytes, _PAGE_SIZE)
-            alloc = CUMemAllocHandle(
-                capacity_bytes, device, CUMemHandleKind.Local
-            )
+            alloc = CUMemAllocHandle(capacity_bytes, device, self._handle_kind)
             mapping = alloc.map(device)
             storage = mapping.to_tensor((capacity_bytes,), torch.uint8)
             entry = _LowLatencyWorkspaceEntry(
@@ -240,6 +249,12 @@ class _LowLatencyWorkspacePool:
 
     def clear(self) -> None:
         self._entries.clear()
+
+    def export_handles(self, num_slots: int) -> list[CUMemExportHandle]:
+        return [self._entries[slot].alloc.export() for slot in range(num_slots)]
+
+    def local_mapping(self, key: int) -> CUMemMapping:
+        return self._entries[key].mapping
 
 
 @dataclass
@@ -398,8 +413,10 @@ class P2PAllToAll(AllToAllKernel):
         self._device = device
         self._global_group = global_group
         self._max_tokens_per_expert = max_tokens_per_expert
-        self._low_latency_workspace_pool = _LowLatencyWorkspacePool()
         self._handle_kind = CUMemHandleKind.FileDescriptor
+        self._low_latency_workspace_pool = _LowLatencyWorkspacePool(
+            self._handle_kind
+        )
         self._num_slots = int(os.environ.get("PPLX_GARDEN_NUM_SLOTS", "2"))
         if self._num_slots < 1:
             raise ValueError("PPLX_GARDEN_NUM_SLOTS must be >= 1")
@@ -461,6 +478,10 @@ class P2PAllToAll(AllToAllKernel):
         self._transfer_engine: Optional[TransferEngine] = None
         self._all_to_all: Optional[AllToAllContext] = None
         self._low_latency_workspace_layout: Optional[dict[str, Any]] = None
+        self._low_latency_workspace_nvl_mappings: list[
+            list[_LowLatencyWorkspacePeerMapping]
+        ] = []
+        self._low_latency_workspace_ptrs: list[list[int]] = []
 
         # Detect topology and identify NICs and CPUs.
         system_topo = TransferEngine.detect_topology()
@@ -811,6 +832,57 @@ class P2PAllToAll(AllToAllKernel):
                 scale_dtype=self._scale_dtype,
                 layout=self._low_latency_workspace_layout,
             )
+        if self._node_group is not None:
+            local_workspace_data = _LowLatencyWorkspaceRankData(
+                workspace_fds=self._low_latency_workspace_pool.export_handles(
+                    self._num_slots
+                )
+            )
+            workspace_handles = self._node_group.all_gather_object(
+                pickle.dumps(local_workspace_data)
+            )
+            self._low_latency_workspace_nvl_mappings = [
+                [] for _ in range(self._num_slots)
+            ]
+            self._low_latency_workspace_ptrs = [
+                [] for _ in range(self._num_slots)
+            ]
+            for peer, payload in enumerate(workspace_handles):
+                if peer == self._node_group.rank:
+                    for slot in range(self._num_slots):
+                        mapping = self._low_latency_workspace_pool.local_mapping(slot)
+                        self._low_latency_workspace_nvl_mappings[slot].append(
+                            _LowLatencyWorkspacePeerMapping(mapping)
+                        )
+                        self._low_latency_workspace_ptrs[slot].append(
+                            mapping.data_ptr()
+                        )
+                    continue
+                assert payload is not None
+                peer_data = pickle.loads(payload)
+                assert isinstance(peer_data, _LowLatencyWorkspaceRankData)
+                if len(peer_data.workspace_fds) != self._num_slots:
+                    raise RuntimeError(
+                        "Peer low-latency workspace slot count mismatch: "
+                        f"expected {self._num_slots}, got "
+                        f"{len(peer_data.workspace_fds)}"
+                    )
+                for slot in range(self._num_slots):
+                    mapping = peer_data.workspace_fds[slot].bind().map(self._device)
+                    self._low_latency_workspace_nvl_mappings[slot].append(
+                        _LowLatencyWorkspacePeerMapping(mapping)
+                    )
+                    self._low_latency_workspace_ptrs[slot].append(
+                        mapping.data_ptr()
+                    )
+                del peer_data
+            self._node_group.barrier()
+            del local_workspace_data
+        else:
+            self._low_latency_workspace_ptrs = [
+                [self._low_latency_workspace_pool.local_mapping(slot).data_ptr()]
+                for slot in range(self._num_slots)
+            ]
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()
@@ -1490,6 +1562,11 @@ class P2PAllToAll(AllToAllKernel):
             return False
         return bool(self._all_to_all.uses_node_route_exchange())
 
+    def debug_low_latency_workspace_ptrs(self) -> list[list[int]]:
+        """Return same-node low-latency workspace base pointers for tests."""
+
+        return [list(slot_ptrs) for slot_ptrs in self._low_latency_workspace_ptrs]
+
     @override
     def destroy(self) -> None:
         """Clean up the all-to-all context."""
@@ -1498,6 +1575,8 @@ class P2PAllToAll(AllToAllKernel):
         self._global_group.barrier()
         self._all_to_all = None
         self._low_latency_workspace_layout = None
+        self._low_latency_workspace_ptrs = []
+        self._low_latency_workspace_nvl_mappings = []
         self._low_latency_workspace_pool.clear()
 
         # Stop the transfer engine once no rank is active.

@@ -260,6 +260,16 @@ def _test_p2p_all_to_all_worker(
                 all_to_all.uses_node_route_exchange()
                 == expected_node_route_exchange
             )
+            ll_workspace_ptrs = all_to_all.debug_low_latency_workspace_ptrs()
+            expected_workspace_peers = (
+                node_group.size if node_group is not None else 1
+            )
+            assert len(ll_workspace_ptrs) == 2
+            assert all(
+                len(slot_ptrs) == expected_workspace_peers
+                and all(ptr != 0 for ptr in slot_ptrs)
+                for slot_ptrs in ll_workspace_ptrs
+            )
             (
                 ll_expert_x,
                 ll_expert_x_scale,
