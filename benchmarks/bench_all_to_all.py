@@ -546,6 +546,26 @@ def benchmark(
         logger.info("  - Network (RDMA):  %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_network_comb_bytes / 1e6, avg_network_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0, network_comb_bandwidth)
         logger.info("============================================================")
 
+        phase_counter_names = [
+            ("wait_dispatch_route_ns", "wait dispatch route"),
+            ("wait_dispatch_send_ns", "wait dispatch send"),
+            ("route_exchange_ns", "wait route exchange"),
+            ("process_routing_ns", "process routing"),
+            ("dispatch_transfer_wait_ns", "wait dispatch transfer"),
+            ("wait_dispatch_recv_ns", "wait dispatch recv"),
+            ("dispatch_barrier_ns", "dispatch barrier"),
+            ("wait_combine_send_ns", "wait combine send"),
+            ("combine_transfer_wait_ns", "wait combine transfer"),
+            ("wait_combine_recv_ns", "wait combine recv"),
+            ("combine_barrier_ns", "combine barrier"),
+        ]
+        logger.info("Worker phase timings (average ms per rank per iteration):")
+        for key, label in phase_counter_names:
+            total_ns = sum(s.get(key, 0) for s in all_perf_stats)
+            avg_ms = total_ns / num_ranks / num_total_iters / 1e6
+            logger.info("  - %-23s %8.3f ms", label + ":", avg_ms)
+        logger.info("============================================================")
+
         # Let's print the per-rank breakdown to show detailed routing patterns
         logger.info("Per-Rank Link Data Volume Breakdown (Average per iteration):")
         for r_id, s in enumerate(all_perf_stats):

@@ -378,6 +378,20 @@ impl PyAllToAllContext {
         dict.set_item("network_combine_bytes", stats.network_combine_bytes)?;
         dict.set_item("peer_dispatch_bytes", &stats.peer_dispatch_bytes)?;
         dict.set_item("peer_combine_bytes", &stats.peer_combine_bytes)?;
+        dict.set_item("wait_dispatch_route_ns", stats.wait_dispatch_route_ns)?;
+        dict.set_item("route_exchange_ns", stats.route_exchange_ns)?;
+        dict.set_item("process_routing_ns", stats.process_routing_ns)?;
+        dict.set_item("wait_dispatch_send_ns", stats.wait_dispatch_send_ns)?;
+        dict.set_item(
+            "dispatch_transfer_wait_ns",
+            stats.dispatch_transfer_wait_ns,
+        )?;
+        dict.set_item("wait_dispatch_recv_ns", stats.wait_dispatch_recv_ns)?;
+        dict.set_item("dispatch_barrier_ns", stats.dispatch_barrier_ns)?;
+        dict.set_item("wait_combine_send_ns", stats.wait_combine_send_ns)?;
+        dict.set_item("combine_transfer_wait_ns", stats.combine_transfer_wait_ns)?;
+        dict.set_item("wait_combine_recv_ns", stats.wait_combine_recv_ns)?;
+        dict.set_item("combine_barrier_ns", stats.combine_barrier_ns)?;
         Ok(dict)
     }
 }

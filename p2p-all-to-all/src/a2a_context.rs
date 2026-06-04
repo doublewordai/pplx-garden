@@ -1122,6 +1122,17 @@ impl AllToAllContext {
             network_combine_bytes: 0,
             peer_dispatch_bytes: vec![0; self.world_size],
             peer_combine_bytes: vec![0; self.world_size],
+            wait_dispatch_route_ns: 0,
+            route_exchange_ns: 0,
+            process_routing_ns: 0,
+            wait_dispatch_send_ns: 0,
+            dispatch_transfer_wait_ns: 0,
+            wait_dispatch_recv_ns: 0,
+            dispatch_barrier_ns: 0,
+            wait_combine_send_ns: 0,
+            combine_transfer_wait_ns: 0,
+            wait_combine_recv_ns: 0,
+            combine_barrier_ns: 0,
         };
         for worker in &self.workers {
             stats.local_dispatch_bytes +=
@@ -1150,6 +1161,39 @@ impl AllToAllContext {
             {
                 *dst += value.load(Ordering::Relaxed);
             }
+            stats.wait_dispatch_route_ns += worker
+                .accumulated_wait_dispatch_route_ns
+                .load(Ordering::Relaxed);
+            stats.route_exchange_ns += worker
+                .accumulated_route_exchange_ns
+                .load(Ordering::Relaxed);
+            stats.process_routing_ns += worker
+                .accumulated_process_routing_ns
+                .load(Ordering::Relaxed);
+            stats.wait_dispatch_send_ns += worker
+                .accumulated_wait_dispatch_send_ns
+                .load(Ordering::Relaxed);
+            stats.dispatch_transfer_wait_ns += worker
+                .accumulated_dispatch_transfer_wait_ns
+                .load(Ordering::Relaxed);
+            stats.wait_dispatch_recv_ns += worker
+                .accumulated_wait_dispatch_recv_ns
+                .load(Ordering::Relaxed);
+            stats.dispatch_barrier_ns += worker
+                .accumulated_dispatch_barrier_ns
+                .load(Ordering::Relaxed);
+            stats.wait_combine_send_ns += worker
+                .accumulated_wait_combine_send_ns
+                .load(Ordering::Relaxed);
+            stats.combine_transfer_wait_ns += worker
+                .accumulated_combine_transfer_wait_ns
+                .load(Ordering::Relaxed);
+            stats.wait_combine_recv_ns += worker
+                .accumulated_wait_combine_recv_ns
+                .load(Ordering::Relaxed);
+            stats.combine_barrier_ns += worker
+                .accumulated_combine_barrier_ns
+                .load(Ordering::Relaxed);
         }
         stats
     }
@@ -1232,6 +1276,17 @@ pub struct AllToAllPerfStats {
     pub network_combine_bytes: u64,
     pub peer_dispatch_bytes: Vec<u64>,
     pub peer_combine_bytes: Vec<u64>,
+    pub wait_dispatch_route_ns: u64,
+    pub route_exchange_ns: u64,
+    pub process_routing_ns: u64,
+    pub wait_dispatch_send_ns: u64,
+    pub dispatch_transfer_wait_ns: u64,
+    pub wait_dispatch_recv_ns: u64,
+    pub dispatch_barrier_ns: u64,
+    pub wait_combine_send_ns: u64,
+    pub combine_transfer_wait_ns: u64,
+    pub wait_combine_recv_ns: u64,
+    pub combine_barrier_ns: u64,
 }
 
 impl Drop for AllToAllContext {

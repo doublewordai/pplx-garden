@@ -688,6 +688,17 @@ pub(crate) struct WorkerState {
     pub(crate) accumulated_network_combine_bytes: AtomicU64,
     pub(crate) peer_dispatch_bytes: Vec<AtomicU64>,
     pub(crate) peer_combine_bytes: Vec<AtomicU64>,
+    pub(crate) accumulated_wait_dispatch_route_ns: AtomicU64,
+    pub(crate) accumulated_route_exchange_ns: AtomicU64,
+    pub(crate) accumulated_process_routing_ns: AtomicU64,
+    pub(crate) accumulated_wait_dispatch_send_ns: AtomicU64,
+    pub(crate) accumulated_dispatch_transfer_wait_ns: AtomicU64,
+    pub(crate) accumulated_wait_dispatch_recv_ns: AtomicU64,
+    pub(crate) accumulated_dispatch_barrier_ns: AtomicU64,
+    pub(crate) accumulated_wait_combine_send_ns: AtomicU64,
+    pub(crate) accumulated_combine_transfer_wait_ns: AtomicU64,
+    pub(crate) accumulated_wait_combine_recv_ns: AtomicU64,
+    pub(crate) accumulated_combine_barrier_ns: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -866,6 +877,17 @@ impl WorkerState {
             accumulated_network_combine_bytes: AtomicU64::new(0),
             peer_dispatch_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
             peer_combine_bytes: (0..world_size).map(|_| AtomicU64::new(0)).collect(),
+            accumulated_wait_dispatch_route_ns: AtomicU64::new(0),
+            accumulated_route_exchange_ns: AtomicU64::new(0),
+            accumulated_process_routing_ns: AtomicU64::new(0),
+            accumulated_wait_dispatch_send_ns: AtomicU64::new(0),
+            accumulated_dispatch_transfer_wait_ns: AtomicU64::new(0),
+            accumulated_wait_dispatch_recv_ns: AtomicU64::new(0),
+            accumulated_dispatch_barrier_ns: AtomicU64::new(0),
+            accumulated_wait_combine_send_ns: AtomicU64::new(0),
+            accumulated_combine_transfer_wait_ns: AtomicU64::new(0),
+            accumulated_wait_combine_recv_ns: AtomicU64::new(0),
+            accumulated_combine_barrier_ns: AtomicU64::new(0),
         })
     }
 
@@ -953,11 +975,17 @@ impl WorkerState {
         true
     }
 
+    fn add_elapsed_ns(counter: &AtomicU64, start: Instant) {
+        let ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+
     fn step(&self) {
         let epoch = self.epoch();
         let trace = std::env::var_os("PPLX_GARDEN_TRACE").is_some();
 
         // Wait for the device to copy the routing info to the host.
+        let wait_dispatch_route_start = Instant::now();
         if !self.wait_epoch_trace(
             "dispatch_route_done",
             &self.slot.dispatch_route_done,
@@ -966,6 +994,10 @@ impl WorkerState {
         ) {
             return;
         }
+        Self::add_elapsed_ns(
+            &self.accumulated_wait_dispatch_route_ns,
+            wait_dispatch_route_start,
+        );
         if !self.is_running() {
             return;
         }
@@ -980,6 +1012,7 @@ impl WorkerState {
             .unwrap();
 
         // Wait for the dispatch kernel to copy tokens into send buffers.
+        let wait_dispatch_send_start = Instant::now();
         if !self.wait_epoch_trace(
             "dispatch_send_done",
             &self.slot.dispatch_send_done,
@@ -988,6 +1021,10 @@ impl WorkerState {
         ) {
             return;
         }
+        Self::add_elapsed_ns(
+            &self.accumulated_wait_dispatch_send_ns,
+            wait_dispatch_send_start,
+        );
         self.slot.tx_ready.set(false);
         if trace {
             eprintln!(
@@ -1027,10 +1064,17 @@ impl WorkerState {
                 self.node_size
             );
         }
+        let route_exchange_start = Instant::now();
         if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
             return;
         }
+        Self::add_elapsed_ns(&self.accumulated_route_exchange_ns, route_exchange_start);
+        let process_routing_start = Instant::now();
         let route = self.process_routing_info(epoch);
+        Self::add_elapsed_ns(
+            &self.accumulated_process_routing_ns,
+            process_routing_start,
+        );
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} route processed num_recv_tx={} dispatch_ranges={} combine_ranges={}",
@@ -1083,7 +1127,12 @@ impl WorkerState {
                     route.num_recv_tx
                 );
             }
+            let dispatch_transfer_wait_start = Instant::now();
             self.dispatch_counter.wait(route.num_recv_tx);
+            Self::add_elapsed_ns(
+                &self.accumulated_dispatch_transfer_wait_ns,
+                dispatch_transfer_wait_start,
+            );
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch counter observed",
@@ -1103,12 +1152,17 @@ impl WorkerState {
                     epoch
                 );
             }
+            let wait_dispatch_recv_start = Instant::now();
             if !self.wait_epoch(
                 &self.slot.dispatch_recv_done,
                 epoch,
             ) {
                 return;
             }
+            Self::add_elapsed_ns(
+                &self.accumulated_wait_dispatch_recv_ns,
+                wait_dispatch_recv_start,
+            );
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch_recv_done observed",
@@ -1120,13 +1174,25 @@ impl WorkerState {
 
             range_end!(dispatch_range);
         }
-        if !self.barrier(
-            "dispatch",
-            self.dispatch_barrier_write_op.clone(),
-            &self.dispatch_barrier_counter,
-            num_dispatch_tx,
-        ) {
-            return;
+        if self.world_size == self.node_size {
+            // Single-node payload lifetime is guarded by the CUDA kernels'
+            // NVLink sync-counter protocol. Avoid the fabric barrier entirely
+            // and release the send buffer for the next dispatch here.
+            self.slot.tx_ready.set(true);
+        } else {
+            let dispatch_barrier_start = Instant::now();
+            if !self.barrier(
+                "dispatch",
+                self.dispatch_barrier_write_op.clone(),
+                &self.dispatch_barrier_counter,
+                num_dispatch_tx,
+            ) {
+                return;
+            }
+            Self::add_elapsed_ns(
+                &self.accumulated_dispatch_barrier_ns,
+                dispatch_barrier_start,
+            );
         }
         if trace {
             eprintln!(
@@ -1150,9 +1216,14 @@ impl WorkerState {
                     route.combine_ranges.len()
                 );
             }
+            let wait_combine_send_start = Instant::now();
             if !self.wait_epoch(&self.slot.combine_send_done, epoch) {
                 return;
             }
+            Self::add_elapsed_ns(
+                &self.accumulated_wait_combine_send_ns,
+                wait_combine_send_start,
+            );
             if !self.is_running() {
                 return;
             }
@@ -1194,9 +1265,14 @@ impl WorkerState {
                     num_combine_imm
                 );
             }
+            let combine_transfer_wait_start = Instant::now();
             if !self.wait_imm(&self.combine_counter, num_combine_imm) {
                 return;
             }
+            Self::add_elapsed_ns(
+                &self.accumulated_combine_transfer_wait_ns,
+                combine_transfer_wait_start,
+            );
             self.slot.combine_recv_flag.set(true);
             if trace {
                 eprintln!(
@@ -1216,9 +1292,14 @@ impl WorkerState {
                     epoch
                 );
             }
+            let wait_combine_recv_start = Instant::now();
             if !self.wait_epoch(&self.slot.combine_recv_done, epoch) {
                 return;
             }
+            Self::add_elapsed_ns(
+                &self.accumulated_wait_combine_recv_ns,
+                wait_combine_recv_start,
+            );
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine_recv_done observed",
@@ -1231,13 +1312,22 @@ impl WorkerState {
             range_end!(combine_range);
         }
 
-        if !self.barrier(
-            "combine",
-            self.combine_barrier_write_op.clone(),
-            &self.combine_barrier_counter,
-            num_combine_tx,
-        ) {
-            return;
+        if self.world_size == self.node_size {
+            self.slot.tx_ready.set(true);
+        } else {
+            let combine_barrier_start = Instant::now();
+            if !self.barrier(
+                "combine",
+                self.combine_barrier_write_op.clone(),
+                &self.combine_barrier_counter,
+                num_combine_tx,
+            ) {
+                return;
+            }
+            Self::add_elapsed_ns(
+                &self.accumulated_combine_barrier_ns,
+                combine_barrier_start,
+            );
         }
         if trace {
             eprintln!(
