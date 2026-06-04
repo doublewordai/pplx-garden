@@ -23,6 +23,7 @@ from tests.markers import (
 )
 from tests.p2p_all_to_all.data import RankTestData
 from tests.p2p_all_to_all.layout import (
+    assert_batched_experts_layout_semantics,
     assert_canonical_batched_experts_layout,
     expected_canonical_batched_experts_route_plan,
 )
@@ -341,6 +342,16 @@ def _test_p2p_all_to_all_worker(
                     local_rank.dp_x_scale,
                     slot_key=0,
                 )
+            assert_batched_experts_layout_semantics(
+                out_expert_x=ll_expert_x,
+                out_expert_x_scale=ll_expert_x_scale,
+                expert_num_tokens=ll_expert_num_tokens,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
             assert_canonical_batched_experts_layout(
                 out_expert_x=ll_expert_x,
                 out_expert_x_scale=ll_expert_x_scale,
@@ -394,6 +405,16 @@ def _test_p2p_all_to_all_worker(
             assert ll_dispatch_handle_interleaved._slot == 1
             ll_dispatch_recv_interleaved()
             torch.cuda.synchronize()
+            assert_batched_experts_layout_semantics(
+                out_expert_x=ll_expert_x_interleaved,
+                out_expert_x_scale=ll_expert_x_scale_interleaved,
+                expert_num_tokens=ll_expert_num_tokens_interleaved,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
             assert_canonical_batched_experts_layout(
                 out_expert_x=ll_expert_x_interleaved,
                 out_expert_x_scale=ll_expert_x_scale_interleaved,
