@@ -1,6 +1,7 @@
 import os
 import pickle
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -58,6 +59,134 @@ class _NVLRankMapping:
     recv_mapping: CUMemMapping
 
 
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+@dataclass
+class _LowLatencyWorkspaceEntry:
+    storage: torch.Tensor
+    in_use: bool = False
+
+
+@dataclass
+class _LowLatencyWorkspaceLease:
+    pool: "_LowLatencyWorkspacePool"
+    key: int
+    expert_num_tokens: torch.Tensor
+    expert_x: torch.Tensor
+    expert_x_scale: Optional[torch.Tensor]
+    indices: torch.Tensor
+    weights: torch.Tensor
+    dp_x: torch.Tensor
+    dp_x_scale: Optional[torch.Tensor]
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.pool.release(self.key)
+
+
+class _LowLatencyWorkspacePool:
+    """Preallocated low-latency dispatch workspaces, keyed by microbatch slot."""
+
+    def __init__(self) -> None:
+        self._entries: dict[int, _LowLatencyWorkspaceEntry] = {}
+
+    def acquire(
+        self,
+        *,
+        key: int,
+        device: torch.device,
+        activation_dtype: torch.dtype,
+        scale_dtype: Optional[torch.dtype],
+        layout: dict[str, Any],
+    ) -> _LowLatencyWorkspaceLease:
+        dtype_map = {
+            "activation": activation_dtype,
+            "scale": scale_dtype,
+            "int32": torch.int32,
+            "uint32": torch.uint32,
+            "float32": torch.float32,
+        }
+        offsets: dict[str, tuple[int, int, tuple[int, ...], torch.dtype]] = {}
+        for name, spec in layout["tensors"].items():
+            dtype_name = spec["dtype"]
+            dtype = dtype_map[dtype_name]
+            if dtype is None:
+                raise RuntimeError(
+                    "PPLX low-latency native workspace layout requested "
+                    f"{name} with dtype={dtype_name}, but no scale dtype exists"
+                )
+            shape = tuple(int(dim) for dim in spec["shape"])
+            nbytes = int(spec["nbytes"])
+            expected_nbytes = _dtype_nbytes(dtype)
+            for dim in shape:
+                expected_nbytes *= dim
+            if expected_nbytes != nbytes:
+                raise RuntimeError(
+                    "PPLX low-latency native workspace layout has inconsistent "
+                    f"nbytes for {name}: expected={expected_nbytes} got={nbytes}"
+                )
+            offsets[name] = (int(spec["offset_bytes"]), nbytes, shape, dtype)
+        total_bytes = int(layout["total_bytes"])
+
+        entry = self._entries.get(key)
+        current_bytes = 0 if entry is None else entry.storage.numel()
+        if entry is not None and entry.in_use:
+            raise RuntimeError(
+                "PPLX low-latency workspace is already in use for "
+                f"slot {key}. Dispatch handles must be microbatch-local and "
+                "released by combine before the slot is reused."
+            )
+        if current_bytes < total_bytes:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "PPLX low-latency workspace would grow during CUDA graph "
+                    f"capture: slot={key} required={total_bytes} "
+                    f"current={current_bytes}"
+                )
+            storage = torch.empty((total_bytes,), dtype=torch.uint8, device=device)
+            entry = _LowLatencyWorkspaceEntry(storage=storage)
+            self._entries[key] = entry
+            logger.info(
+                "PPLX low-latency workspace allocate: slot=%s bytes=%.2f GiB "
+                "expert_x=%s %s",
+                key,
+                total_bytes / 1024**3,
+                offsets["expert_x"][2],
+                activation_dtype,
+            )
+        assert entry is not None
+        entry.in_use = True
+        storage = entry.storage
+
+        def view(name: str) -> torch.Tensor:
+            offset, nbytes, shape, dtype = offsets[name]
+            return storage[offset : offset + nbytes].view(dtype).reshape(shape)
+
+        return _LowLatencyWorkspaceLease(
+            pool=self,
+            key=key,
+            expert_num_tokens=view("expert_num_tokens"),
+            expert_x=view("expert_x"),
+            expert_x_scale=(
+                view("expert_x_scale") if "expert_x_scale" in offsets else None
+            ),
+            indices=view("indices"),
+            weights=view("weights"),
+            dp_x=view("dp_x"),
+            dp_x_scale=(view("dp_x_scale") if "dp_x_scale" in offsets else None),
+        )
+
+    def release(self, key: int) -> None:
+        entry = self._entries.get(key)
+        if entry is not None:
+            entry.in_use = False
+
+
 @dataclass
 class P2PDispatchHandle:
     kernel: "P2PAllToAll"
@@ -71,6 +200,8 @@ class P2PDispatchHandle:
     bound_m: Optional[torch.Tensor]
     send_done_event: torch.cuda.Event
     _slot: int
+    _generation: int
+    workspace_lease: Optional[_LowLatencyWorkspaceLease] = None
     recv_done_event: Optional[torch.cuda.Event] = None
     recv_done: bool = False
 
@@ -88,6 +219,7 @@ class P2PDispatchHandle:
             weights=self.weights,
             bound_m=self.bound_m,
             _slot=self._slot,
+            _generation=self._generation,
             do_send=False,
             do_recv=True,
         )
@@ -113,6 +245,7 @@ class P2PCombineHandle:
     accumulate: bool
     send_done_event: torch.cuda.Event
     _slot: int
+    _generation: int
     recv_done_event: Optional[torch.cuda.Event] = None
     recv_done: bool = False
 
@@ -129,6 +262,7 @@ class P2PCombineHandle:
             expert_y=self.expert_y,
             bound_m=self.bound_m,
             _slot=self._slot,
+            _generation=self._generation,
             do_send=False,
             do_recv=True,
             accumulate=self.accumulate,
@@ -136,6 +270,10 @@ class P2PCombineHandle:
         self.recv_done_event = torch.cuda.Event()
         self.recv_done_event.record(torch.cuda.current_stream(self.out_tokens.device))
         self.recv_done = True
+        lease = self.dispatch_handle.workspace_lease
+        if lease is not None:
+            self.dispatch_handle.workspace_lease = None
+            lease.release()
 
     def wait_recv_done(self) -> None:
         self.recv()
@@ -169,6 +307,7 @@ class P2PAllToAll(AllToAllKernel):
         worker_cpu: Optional[int] = None,
         max_tokens_per_expert: Optional[int] = None,
     ) -> None:
+        self._max_num_tokens = max_num_tokens
         self._hidden_dim = hidden_dim
         self._hidden_dim_scale = hidden_dim_scale
         self._num_experts_per_token = num_experts_per_token
@@ -178,12 +317,14 @@ class P2PAllToAll(AllToAllKernel):
         self._device = device
         self._global_group = global_group
         self._max_tokens_per_expert = max_tokens_per_expert
+        self._low_latency_workspace_pool = _LowLatencyWorkspacePool()
         self._handle_kind = CUMemHandleKind.FileDescriptor
         self._num_slots = int(os.environ.get("PPLX_GARDEN_NUM_SLOTS", "2"))
         if self._num_slots < 1:
             raise ValueError("PPLX_GARDEN_NUM_SLOTS must be >= 1")
         self._capture_free_slots = list(range(self._num_slots))
         self._sync_slot: Optional[int] = None
+        self._sync_generation: Optional[int] = None
         _CUDA_GRAPH_KERNELS.add(self)
 
         # Determine the number of local experts.
@@ -224,6 +365,7 @@ class P2PAllToAll(AllToAllKernel):
 
         self._transfer_engine: Optional[TransferEngine] = None
         self._all_to_all: Optional[AllToAllContext] = None
+        self._low_latency_workspace_layout: Optional[dict[str, Any]] = None
 
         # Detect topology and identify NICs and CPUs.
         system_topo = TransferEngine.detect_topology()
@@ -493,6 +635,9 @@ class P2PAllToAll(AllToAllKernel):
             worker_cpu=worker_cpu,
             num_slots=num_slots,
         )
+        self._low_latency_workspace_layout = (
+            self._all_to_all.low_latency_workspace_layout()
+        )
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()
@@ -527,6 +672,7 @@ class P2PAllToAll(AllToAllKernel):
         do_send: bool = True,
         do_recv: bool = True,
         _slot: Optional[int] = None,
+        _generation: Optional[int] = None,
     ) -> None:
         assert self._all_to_all is not None
         assert do_send or do_recv
@@ -633,7 +779,7 @@ class P2PAllToAll(AllToAllKernel):
                 )
 
             if _slot is None:
-                _slot = all_to_all.dispatch_send(
+                native_handle = all_to_all.dispatch_send(
                     num_tokens=num_tokens,
                     x_ptr=x_ptr,
                     x_stride=x_stride * self._in_dtype.itemsize,
@@ -647,8 +793,10 @@ class P2PAllToAll(AllToAllKernel):
                     bound_m_ptr=bound_m_ptr,
                     stream=stream,
                 )
+                _slot = int(native_handle["slot"])
+                _generation = int(native_handle["generation"])
             else:
-                all_to_all.dispatch_send_on_slot(
+                native_handle = all_to_all.dispatch_send_on_slot(
                     slot=_slot,
                     num_tokens=num_tokens,
                     x_ptr=x_ptr,
@@ -663,15 +811,21 @@ class P2PAllToAll(AllToAllKernel):
                     bound_m_ptr=bound_m_ptr,
                     stream=stream,
                 )
+                _generation = int(native_handle["generation"])
             self._sync_slot = _slot
+            self._sync_generation = _generation
 
         if _slot is None:
             _slot = self._sync_slot
+        if _generation is None:
+            _generation = self._sync_generation
         assert _slot is not None
+        assert _generation is not None
 
         if do_recv:
             all_to_all.dispatch_recv(
                 slot=_slot,
+                generation=_generation,
                 out_num_tokens_ptr=out_expert_num_tokens_ptr,
                 out_x_ptr=out_x_ptr,
                 out_x_stride=out_x_stride,
@@ -718,6 +872,7 @@ class P2PAllToAll(AllToAllKernel):
         indices: torch.Tensor,
         weights: torch.Tensor,
         bound_m: Optional[torch.Tensor] = None,
+        slot: Optional[int] = None,
     ) -> P2PDispatchHandle:
         self.dispatch(
             out_expert_num_tokens=out_expert_num_tokens,
@@ -730,9 +885,12 @@ class P2PAllToAll(AllToAllKernel):
             bound_m=bound_m,
             do_send=True,
             do_recv=False,
+            _slot=slot,
         )
         assert self._sync_slot is not None
-        slot = self._sync_slot
+        assert self._sync_generation is not None
+        native_slot = self._sync_slot
+        native_generation = self._sync_generation
         send_done_event = torch.cuda.Event()
         send_done_event.record(torch.cuda.current_stream(dp_x.device))
         return P2PDispatchHandle(
@@ -746,7 +904,151 @@ class P2PAllToAll(AllToAllKernel):
             weights=weights,
             bound_m=bound_m,
             send_done_event=send_done_event,
-            _slot=slot,
+            _slot=native_slot,
+            _generation=native_generation,
+        )
+
+    def low_latency_dispatch(
+        self,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        *,
+        slot_key: int = 0,
+        apply_router_weight_on_input: bool = False,
+        bound_m: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        P2PDispatchHandle,
+        Callable[[], None],
+    ]:
+        """Dispatch using a NIXL-EP-LL style backend-owned workspace.
+
+        The public contract is standard BatchedExperts:
+        ``expert_x[local_expert, token_slot, hidden]`` plus
+        ``expert_num_tokens[local_expert]``. Routing tensors and the workspace
+        lifetime stay attached to the returned dispatch handle so combine can
+        invert the route without ambient mutable state.
+        """
+
+        assert self._max_tokens_per_expert is not None
+        if x.ndim != 2 or x.shape[1] != self._hidden_dim:
+            raise ValueError(
+                "PPLX low-latency dispatch expected x with shape "
+                f"(tokens, {self._hidden_dim}), got {tuple(x.shape)}"
+            )
+        if x.dtype != self._in_dtype:
+            raise TypeError(
+                f"PPLX low-latency dispatch expected {self._in_dtype}, got {x.dtype}"
+            )
+        if self._hidden_dim_scale is None:
+            if x_scale is not None:
+                raise ValueError(
+                    "PPLX low-latency dispatch received x_scale for an "
+                    "unscaled configuration"
+                )
+        else:
+            if x_scale is None:
+                raise ValueError(
+                    "PPLX low-latency dispatch requires x_scale for this "
+                    "scaled configuration"
+                )
+            if x_scale.shape != (x.shape[0], self._hidden_dim_scale):
+                raise ValueError(
+                    "PPLX low-latency dispatch expected x_scale with shape "
+                    f"({x.shape[0]}, {self._hidden_dim_scale}), got "
+                    f"{tuple(x_scale.shape)}"
+                )
+            if x_scale.dtype != self._scale_dtype:
+                raise TypeError(
+                    "PPLX low-latency dispatch expected x_scale dtype "
+                    f"{self._scale_dtype}, got {x_scale.dtype}"
+                )
+        if topk_ids.shape != topk_weights.shape:
+            raise ValueError(
+                "PPLX low-latency dispatch expected topk ids and weights to "
+                f"have the same shape, got {tuple(topk_ids.shape)} and "
+                f"{tuple(topk_weights.shape)}"
+            )
+        num_tokens, topk = topk_ids.shape
+        if num_tokens > self._max_num_tokens:
+            raise ValueError(
+                "PPLX low-latency dispatch received more tokens than capacity: "
+                f"num_tokens={num_tokens} max_tokens={self._max_num_tokens}"
+            )
+        if topk != self._num_experts_per_token:
+            raise ValueError(
+                "PPLX low-latency dispatch expected topk="
+                f"{self._num_experts_per_token}, got {topk}"
+            )
+        if apply_router_weight_on_input and topk != 1:
+            raise NotImplementedError(
+                "PPLX low-latency apply_router_weight_on_input supports topk=1"
+            )
+
+        assert self._low_latency_workspace_layout is not None
+        lease = self._low_latency_workspace_pool.acquire(
+            key=slot_key,
+            device=x.device,
+            activation_dtype=self._in_dtype,
+            scale_dtype=self._scale_dtype,
+            layout=self._low_latency_workspace_layout,
+        )
+
+        try:
+            indices = lease.indices[:num_tokens]
+            weights = lease.weights[:num_tokens]
+            indices.copy_(topk_ids)
+            if x_scale is None:
+                dispatch_x_scale = None
+            elif x_scale.is_contiguous():
+                dispatch_x_scale = x_scale
+            else:
+                assert lease.dp_x_scale is not None
+                lease.dp_x_scale[:num_tokens].copy_(x_scale)
+                dispatch_x_scale = lease.dp_x_scale[:num_tokens]
+
+            if apply_router_weight_on_input:
+                weights.fill_(1.0)
+                torch.mul(
+                    x,
+                    topk_weights.to(dtype=x.dtype),
+                    out=lease.dp_x[:num_tokens],
+                )
+                dispatch_x = lease.dp_x[:num_tokens]
+            else:
+                weights.copy_(topk_weights)
+                if x.is_contiguous():
+                    dispatch_x = x
+                else:
+                    lease.dp_x[:num_tokens].copy_(x)
+                    dispatch_x = lease.dp_x[:num_tokens]
+
+            handle = self.dispatch_async(
+                out_expert_num_tokens=lease.expert_num_tokens,
+                out_expert_x=lease.expert_x,
+                out_expert_x_scale=lease.expert_x_scale,
+                dp_x=dispatch_x,
+                dp_x_scale=dispatch_x_scale,
+                indices=indices,
+                weights=weights,
+                bound_m=bound_m,
+                slot=slot_key,
+            )
+            handle.workspace_lease = lease
+        except Exception:
+            lease.release()
+            raise
+
+        return (
+            lease.expert_x,
+            lease.expert_x_scale,
+            lease.expert_num_tokens,
+            handle,
+            handle.recv,
         )
 
     @override
@@ -761,6 +1063,7 @@ class P2PAllToAll(AllToAllKernel):
         do_recv: bool = True,
         accumulate: bool = False,
         _slot: Optional[int] = None,
+        _generation: Optional[int] = None,
     ) -> None:
         assert self._all_to_all is not None
         assert do_send or do_recv
@@ -812,7 +1115,10 @@ class P2PAllToAll(AllToAllKernel):
 
         if _slot is None:
             _slot = self._sync_slot
+        if _generation is None:
+            _generation = self._sync_generation
         assert _slot is not None
+        assert _generation is not None
 
         if do_send:
             if torch.cuda.is_current_stream_capturing():
@@ -848,6 +1154,7 @@ class P2PAllToAll(AllToAllKernel):
                 )
             all_to_all.combine_send(
                 slot=_slot,
+                generation=_generation,
                 expert_x_ptr=expert_y_ptr,
                 expert_x_stride=expert_y_stride,
                 stream=stream,
@@ -856,6 +1163,7 @@ class P2PAllToAll(AllToAllKernel):
         if do_recv:
             all_to_all.combine_recv(
                 slot=_slot,
+                generation=_generation,
                 num_tokens=num_tokens,
                 num_recv_tokens=num_recv_tokens,
                 expert_y_dtype=expert_y.dtype,
@@ -871,6 +1179,7 @@ class P2PAllToAll(AllToAllKernel):
             )
             if self._sync_slot == _slot:
                 self._sync_slot = None
+                self._sync_generation = None
             if torch.cuda.is_current_stream_capturing():
                 self._release_cuda_graph_capture_slot(_slot)
 
@@ -894,6 +1203,7 @@ class P2PAllToAll(AllToAllKernel):
             do_recv=False,
             accumulate=accumulate,
             _slot=dispatch_handle._slot,
+            _generation=dispatch_handle._generation,
         )
         send_done_event = torch.cuda.Event()
         send_done_event.record(torch.cuda.current_stream(out_tokens.device))
@@ -906,7 +1216,28 @@ class P2PAllToAll(AllToAllKernel):
             accumulate=accumulate,
             send_done_event=send_done_event,
             _slot=dispatch_handle._slot,
+            _generation=dispatch_handle._generation,
         )
+
+    def low_latency_combine(
+        self,
+        expert_y: torch.Tensor,
+        dispatch_handle: P2PDispatchHandle,
+        *,
+        out: torch.Tensor,
+        bound_m: Optional[torch.Tensor] = None,
+        accumulate: bool = False,
+    ) -> tuple[P2PCombineHandle, Callable[[], None]]:
+        """Combine the output of ``low_latency_dispatch`` into ``out``."""
+
+        combine_handle = self.combine_async(
+            out_tokens=out,
+            dispatch_handle=dispatch_handle,
+            expert_y=expert_y,
+            bound_m=bound_m,
+            accumulate=accumulate,
+        )
+        return combine_handle, combine_handle.recv
 
     def get_perf_stats(self) -> dict[str, Any]:
         if self._all_to_all is None:
@@ -920,6 +1251,7 @@ class P2PAllToAll(AllToAllKernel):
         # Stop the a2a engine, ensuring all RDMA transfers complete.
         self._global_group.barrier()
         self._all_to_all = None
+        self._low_latency_workspace_layout = None
 
         # Stop the transfer engine once no rank is active.
         self._global_group.barrier()

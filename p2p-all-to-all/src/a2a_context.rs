@@ -1,7 +1,10 @@
 use std::{
     ffi::c_void,
     ptr::null_mut,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
 };
 
@@ -18,6 +21,62 @@ use crate::{
     a2a_handles::AllToAllRankHandle,
     a2a_worker::{SlotPool, WorkerState},
 };
+
+const LOW_LATENCY_WORKSPACE_ALIGNMENT: usize = 256;
+
+#[derive(Debug, Clone)]
+pub struct LowLatencyWorkspaceTensorSpec {
+    pub name: &'static str,
+    pub offset_bytes: usize,
+    pub nbytes: usize,
+    pub shape: Vec<usize>,
+    pub dtype: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct LowLatencyWorkspaceLayout {
+    pub alignment: usize,
+    pub total_bytes: usize,
+    pub tensors: Vec<LowLatencyWorkspaceTensorSpec>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchHandleState {
+    pub slot: usize,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotGenerationState {
+    Idle,
+    DispatchSent { generation: u64, num_tokens: usize },
+    DispatchReceived { generation: u64, num_tokens: usize },
+    CombineSent { generation: u64, num_tokens: usize },
+}
+
+fn align_up(value: usize, alignment: usize) -> usize {
+    value.div_ceil(alignment) * alignment
+}
+
+fn add_workspace_tensor(
+    tensors: &mut Vec<LowLatencyWorkspaceTensorSpec>,
+    total_bytes: &mut usize,
+    name: &'static str,
+    shape: Vec<usize>,
+    dtype: &'static str,
+    element_size: usize,
+) {
+    *total_bytes = align_up(*total_bytes, LOW_LATENCY_WORKSPACE_ALIGNMENT);
+    let nbytes = shape.iter().product::<usize>() * element_size;
+    tensors.push(LowLatencyWorkspaceTensorSpec {
+        name,
+        offset_bytes: *total_bytes,
+        nbytes,
+        shape,
+        dtype,
+    });
+    *total_bytes += nbytes;
+}
 
 // Collects the private workspace buffers used by dispatch and combine.
 struct DeviceWorkspace {
@@ -132,6 +191,7 @@ pub struct AllToAllContext {
     num_experts: usize,
     max_num_tokens: usize,
     max_recv_tokens: usize,
+    max_tokens_per_expert: usize,
     num_experts_per_token: usize,
     max_private_tokens: usize,
     rank: usize,
@@ -143,6 +203,8 @@ pub struct AllToAllContext {
     workers: Vec<Arc<WorkerState>>,
     threads: Vec<JoinHandle<()>>,
     slot_pool: Arc<SlotPool>,
+    next_generation: AtomicU64,
+    slot_states: Vec<Mutex<SlotGenerationState>>,
     num_blocks: usize,
 }
 
@@ -342,6 +404,7 @@ impl AllToAllContext {
             num_experts,
             max_num_tokens,
             max_recv_tokens,
+            max_tokens_per_expert,
             num_experts_per_token,
             max_private_tokens,
             rank,
@@ -353,6 +416,10 @@ impl AllToAllContext {
             workers,
             threads,
             slot_pool,
+            next_generation: AtomicU64::new(1),
+            slot_states: (0..num_slots)
+                .map(|_| Mutex::new(SlotGenerationState::Idle))
+                .collect(),
             num_blocks,
         })
     }
@@ -384,6 +451,116 @@ impl AllToAllContext {
             .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
     }
 
+    fn slot_state(&self, slot: usize) -> Result<&Mutex<SlotGenerationState>> {
+        self.slot_states
+            .get(slot)
+            .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
+    }
+
+    fn begin_dispatch_handle(
+        &self,
+        slot: usize,
+        num_tokens: usize,
+    ) -> Result<DispatchHandleState> {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.slot_state(slot)?.lock().unwrap();
+        match *state {
+            SlotGenerationState::Idle => {
+                *state = SlotGenerationState::DispatchSent { generation, num_tokens };
+                Ok(DispatchHandleState { slot, generation })
+            }
+            other => Err(anyhow!(
+                "All-to-all slot {slot} expected Idle before dispatch, found {other:?}"
+            )),
+        }
+    }
+
+    fn validate_dispatch_handle(
+        &self,
+        slot: usize,
+        generation: u64,
+        expected: &'static str,
+    ) -> Result<usize> {
+        let state = self.slot_state(slot)?.lock().unwrap();
+        match (*state, expected) {
+            (
+                SlotGenerationState::DispatchSent {
+                    generation: state_generation,
+                    num_tokens,
+                },
+                "DispatchSent",
+            )
+            | (
+                SlotGenerationState::DispatchReceived {
+                    generation: state_generation,
+                    num_tokens,
+                },
+                "DispatchReceived",
+            )
+            | (
+                SlotGenerationState::CombineSent {
+                    generation: state_generation,
+                    num_tokens,
+                },
+                "CombineSent",
+            ) if state_generation == generation => Ok(num_tokens),
+            (state, _) => Err(anyhow!(
+                "All-to-all stale or invalid handle for slot {slot}: \
+                 expected {expected} generation {generation}, found {state:?}"
+            )),
+        }
+    }
+
+    fn transition_dispatch_received(&self, slot: usize, generation: u64) -> Result<()> {
+        let mut state = self.slot_state(slot)?.lock().unwrap();
+        match *state {
+            SlotGenerationState::DispatchSent {
+                generation: state_generation,
+                num_tokens,
+            } if state_generation == generation => {
+                *state =
+                    SlotGenerationState::DispatchReceived { generation, num_tokens };
+                Ok(())
+            }
+            current => Err(anyhow!(
+                "All-to-all stale or invalid dispatch recv for slot {slot}: \
+                 generation {generation}, found {current:?}"
+            )),
+        }
+    }
+
+    fn transition_combine_sent(&self, slot: usize, generation: u64) -> Result<()> {
+        let mut state = self.slot_state(slot)?.lock().unwrap();
+        match *state {
+            SlotGenerationState::DispatchReceived {
+                generation: state_generation,
+                num_tokens,
+            } if state_generation == generation => {
+                *state = SlotGenerationState::CombineSent { generation, num_tokens };
+                Ok(())
+            }
+            current => Err(anyhow!(
+                "All-to-all stale or invalid combine send for slot {slot}: \
+                 generation {generation}, found {current:?}"
+            )),
+        }
+    }
+
+    fn release_handle(&self, slot: usize, generation: u64) -> Result<()> {
+        let mut state = self.slot_state(slot)?.lock().unwrap();
+        match *state {
+            SlotGenerationState::CombineSent {
+                generation: state_generation, ..
+            } if state_generation == generation => {
+                *state = SlotGenerationState::Idle;
+                Ok(())
+            }
+            current => Err(anyhow!(
+                "All-to-all stale or invalid combine recv for slot {slot}: \
+                 generation {generation}, found {current:?}"
+            )),
+        }
+    }
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_send(
         &mut self,
@@ -399,12 +576,12 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         stream: u64,
-    ) -> Result<usize> {
+    ) -> Result<DispatchHandleState> {
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
         let slot = self.slot_pool.acquire();
-        self.dispatch_send_on_slot(
+        self.dispatch_send_on_reserved_slot(
             slot,
             num_tokens,
             x_ptr,
@@ -418,7 +595,8 @@ impl AllToAllContext {
             weights_stride,
             bound_m_ptr,
             stream,
-        )
+        )?;
+        self.begin_dispatch_handle(slot, num_tokens)
     }
 
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -437,7 +615,50 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         stream: u64,
-    ) -> Result<usize> {
+    ) -> Result<DispatchHandleState> {
+        if num_tokens > self.max_num_tokens {
+            return Err(anyhow!("Number of tokens exceeds maximum allowed"));
+        }
+        if !self.slot_pool.acquire_specific(slot) {
+            return Err(anyhow!(
+                "All-to-all slot {slot} is already in use or does not exist"
+            ));
+        }
+        self.dispatch_send_on_reserved_slot(
+            slot,
+            num_tokens,
+            x_ptr,
+            x_stride,
+            x_scale_ptr,
+            x_scale_stride_elem,
+            x_scale_stride_token,
+            indices,
+            indices_stride,
+            weights,
+            weights_stride,
+            bound_m_ptr,
+            stream,
+        )?;
+        self.begin_dispatch_handle(slot, num_tokens)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+    fn dispatch_send_on_reserved_slot(
+        &mut self,
+        slot: usize,
+        num_tokens: usize,
+        x_ptr: *const c_void,
+        x_stride: usize,
+        x_scale_ptr: *const c_void,
+        x_scale_stride_elem: usize,
+        x_scale_stride_token: usize,
+        indices: *const i32,
+        indices_stride: usize,
+        weights: *const f32,
+        weights_stride: usize,
+        bound_m_ptr: *const i32,
+        stream: u64,
+    ) -> Result<()> {
         if num_tokens > self.max_num_tokens {
             return Err(anyhow!("Number of tokens exceeds maximum allowed"));
         }
@@ -521,13 +742,14 @@ impl AllToAllContext {
         if worker.failed() {
             return Err(anyhow!("a2a_dispatch_send slot {slot}: fabric-lib transfer error"));
         }
-        Ok(slot)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_recv(
         &mut self,
         slot: usize,
+        generation: u64,
         out_num_tokens_ptr: *mut i32,
         out_x_ptr: *mut c_void,
         out_x_stride: usize,
@@ -536,6 +758,7 @@ impl AllToAllContext {
         out_x_scale_stride_token: usize,
         stream: u64,
     ) -> Result<()> {
+        self.validate_dispatch_handle(slot, generation, "DispatchSent")?;
         let num_blocks = self.num_blocks;
         let hidden_dim = self.hidden_dim;
         let hidden_dim_scale = self.hidden_dim_scale;
@@ -590,6 +813,7 @@ impl AllToAllContext {
             return Err(anyhow!("a2a_dispatch_recv slot {slot}: fabric-lib transfer error"));
         }
 
+        self.transition_dispatch_received(slot, generation)?;
         Ok(())
     }
 
@@ -601,10 +825,12 @@ impl AllToAllContext {
     pub fn combine_send(
         &mut self,
         slot: usize,
+        generation: u64,
         expert_x_ptr: *const c_void,
         expert_x_stride: usize,
         stream: u64,
     ) -> Result<()> {
+        self.validate_dispatch_handle(slot, generation, "DispatchReceived")?;
         let num_blocks = self.num_blocks;
         let hidden_dim = self.hidden_dim;
         let out_elemsize = self.out_elemsize;
@@ -663,6 +889,7 @@ impl AllToAllContext {
             return Err(anyhow!("a2a_combine_send slot {slot}: fabric-lib transfer error"));
         }
 
+        self.transition_combine_sent(slot, generation)?;
         Ok(())
     }
 
@@ -674,6 +901,7 @@ impl AllToAllContext {
     pub fn combine_recv(
         &mut self,
         slot: usize,
+        generation: u64,
         num_tokens: usize,
         num_recv_tokens: usize,
         expert_y_dtype: ScalarType,
@@ -687,6 +915,14 @@ impl AllToAllContext {
         accumulate: bool,
         stream: u64,
     ) -> Result<()> {
+        let expected_num_tokens =
+            self.validate_dispatch_handle(slot, generation, "CombineSent")?;
+        if expected_num_tokens != num_tokens {
+            return Err(anyhow!(
+                "All-to-all combine recv token count mismatch for slot {slot}: \
+                 handle has {expected_num_tokens}, call has {num_tokens}"
+            ));
+        }
         let num_blocks = self.num_blocks;
         let hidden_dim = self.hidden_dim;
         let out_elemsize = self.out_elemsize;
@@ -765,7 +1001,84 @@ impl AllToAllContext {
             return Err(anyhow!("a2a_combine_recv slot {slot}: fabric-lib transfer error"));
         }
 
+        self.release_handle(slot, generation)?;
         Ok(())
+    }
+
+    pub fn low_latency_workspace_layout(&self) -> LowLatencyWorkspaceLayout {
+        let num_ep_groups = self.world_size / self.dp_size;
+        let num_local_experts = self.num_experts.div_ceil(num_ep_groups);
+
+        let mut tensors = Vec::new();
+        let mut total_bytes = 0;
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "expert_num_tokens",
+            vec![num_local_experts],
+            "int32",
+            ScalarType::I32.element_size(),
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "expert_x",
+            vec![num_local_experts, self.max_tokens_per_expert, self.hidden_dim],
+            "activation",
+            self.in_elemsize,
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "indices",
+            vec![self.max_num_tokens, self.num_experts_per_token],
+            "uint32",
+            ScalarType::U32.element_size(),
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "weights",
+            vec![self.max_num_tokens, self.num_experts_per_token],
+            "float32",
+            ScalarType::F32.element_size(),
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "dp_x",
+            vec![self.max_num_tokens, self.hidden_dim],
+            "activation",
+            self.in_elemsize,
+        );
+        if self.scale_elemsize != 0 {
+            add_workspace_tensor(
+                &mut tensors,
+                &mut total_bytes,
+                "expert_x_scale",
+                vec![
+                    num_local_experts,
+                    self.max_tokens_per_expert,
+                    self.hidden_dim_scale,
+                ],
+                "scale",
+                self.scale_elemsize,
+            );
+            add_workspace_tensor(
+                &mut tensors,
+                &mut total_bytes,
+                "dp_x_scale",
+                vec![self.max_num_tokens, self.hidden_dim_scale],
+                "scale",
+                self.scale_elemsize,
+            );
+        }
+
+        LowLatencyWorkspaceLayout {
+            alignment: LOW_LATENCY_WORKSPACE_ALIGNMENT,
+            total_bytes: align_up(total_bytes, LOW_LATENCY_WORKSPACE_ALIGNMENT),
+            tensors,
+        }
     }
 
     pub fn get_perf_stats(&self) -> AllToAllPerfStats {

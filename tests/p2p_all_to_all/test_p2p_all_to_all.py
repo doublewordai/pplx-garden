@@ -244,6 +244,107 @@ def _test_p2p_all_to_all_worker(
                 tokens_on_rank.add(hash_token(token))
             if out_expert_x.ndim == 2:
                 index = round_up(index + n, config.expert_padding)
+
+        # Verify the backend-owned low-latency API used by vLLM's NIXL-like
+        # PrepareAndFinalize path.
+        if config.max_tokens_per_expert is not None:
+            (
+                ll_expert_x,
+                ll_expert_x_scale,
+                ll_expert_num_tokens,
+                ll_dispatch_handle,
+                ll_dispatch_recv,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
+            )
+            assert ll_dispatch_handle._slot == 0
+            ll_dispatch_recv()
+            torch.cuda.synchronize()
+            with pytest.raises(RuntimeError, match="already in use"):
+                all_to_all.low_latency_dispatch(
+                    local_rank.dp_x,
+                    local_rank.indices,
+                    local_rank.weights,
+                    local_rank.dp_x_scale,
+                    slot_key=0,
+                )
+            assert_canonical_batched_experts_layout(
+                out_expert_x=ll_expert_x,
+                out_expert_x_scale=ll_expert_x_scale,
+                expert_num_tokens=ll_expert_num_tokens,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            ll_expert_y = _act(
+                ll_expert_x.reshape(-1, hidden_dim),
+                (
+                    None
+                    if ll_expert_x_scale is None
+                    else ll_expert_x_scale.reshape(-1, hidden_dim_scale)
+                ),
+            ).to(out_dtype)
+            ll_expert_y = ll_expert_y.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+            ll_out_tokens = torch.empty_like(out_tokens)
+            _ll_combine_handle, ll_combine_recv = all_to_all.low_latency_combine(
+                ll_expert_y,
+                ll_dispatch_handle,
+                out=ll_out_tokens,
+                bound_m=local_rank.bound_m,
+            )
+            ll_combine_recv()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ll_out_tokens, ref_out_tokens)
+
+            (
+                _ll_expert_x_reuse,
+                _ll_expert_x_scale_reuse,
+                _ll_expert_num_tokens_reuse,
+                ll_dispatch_handle_reuse,
+                ll_dispatch_recv_reuse,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
+            )
+            assert ll_dispatch_handle_reuse._slot == 0
+            ll_dispatch_recv_reuse()
+            _ll_combine_handle_reuse, ll_combine_recv_reuse = (
+                all_to_all.low_latency_combine(
+                    ll_expert_y,
+                    ll_dispatch_handle_reuse,
+                    out=ll_out_tokens,
+                    bound_m=local_rank.bound_m,
+                )
+            )
+            ll_combine_recv_reuse()
+            torch.cuda.synchronize()
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                all_to_all.low_latency_combine(
+                    ll_expert_y,
+                    ll_dispatch_handle,
+                    out=ll_out_tokens,
+                    bound_m=local_rank.bound_m,
+                )
     except Exception:
         logger.exception("All-to-all failed")
         raise
@@ -431,6 +532,7 @@ def _test_p2p_all_to_all_worker(
                 hidden_dim=128,
                 hidden_dim_scale=16,
                 max_private_tokens=None,
+                max_tokens_per_expert=4,
                 num_experts_per_token=2,
                 in_dtype=torch.bfloat16,
                 out_dtype=torch.bfloat16,

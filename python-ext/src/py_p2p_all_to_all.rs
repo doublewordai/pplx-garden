@@ -134,8 +134,9 @@ impl PyAllToAllContext {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_send(
+    fn dispatch_send<'py>(
         &mut self,
+        py: Python<'py>,
         num_tokens: usize,
         x_ptr: u64,
         x_stride: usize,
@@ -148,8 +149,9 @@ impl PyAllToAllContext {
         weights_stride: usize,
         bound_m_ptr: Option<u64>,
         stream: u64,
-    ) -> PyResult<usize> {
-        self.ctx
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let handle = self
+            .ctx
             .dispatch_send(
                 num_tokens,
                 x_ptr as *const c_void,
@@ -164,12 +166,17 @@ impl PyAllToAllContext {
                 bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
                 stream,
             )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let dict = PyDict::new(py);
+        dict.set_item("slot", handle.slot)?;
+        dict.set_item("generation", handle.generation)?;
+        Ok(dict)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_send_on_slot(
+    fn dispatch_send_on_slot<'py>(
         &mut self,
+        py: Python<'py>,
         slot: usize,
         num_tokens: usize,
         x_ptr: u64,
@@ -183,8 +190,9 @@ impl PyAllToAllContext {
         weights_stride: usize,
         bound_m_ptr: Option<u64>,
         stream: u64,
-    ) -> PyResult<usize> {
-        self.ctx
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let handle = self
+            .ctx
             .dispatch_send_on_slot(
                 slot,
                 num_tokens,
@@ -200,13 +208,38 @@ impl PyAllToAllContext {
                 bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
                 stream,
             )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let dict = PyDict::new(py);
+        dict.set_item("slot", handle.slot)?;
+        dict.set_item("generation", handle.generation)?;
+        Ok(dict)
     }
 
+    fn low_latency_workspace_layout<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let layout = self.ctx.low_latency_workspace_layout();
+        let dict = PyDict::new(py);
+        let tensors = PyDict::new(py);
+        dict.set_item("alignment", layout.alignment)?;
+        dict.set_item("total_bytes", layout.total_bytes)?;
+        for tensor in layout.tensors {
+            let spec = PyDict::new(py);
+            spec.set_item("offset_bytes", tensor.offset_bytes)?;
+            spec.set_item("nbytes", tensor.nbytes)?;
+            spec.set_item("shape", tensor.shape)?;
+            spec.set_item("dtype", tensor.dtype)?;
+            tensors.set_item(tensor.name, spec)?;
+        }
+        dict.set_item("tensors", tensors)?;
+        Ok(dict)
+    }
     #[allow(clippy::too_many_arguments)]
     fn dispatch_recv(
         &mut self,
         slot: usize,
+        generation: u64,
         out_num_tokens_ptr: u64,
         out_x_ptr: u64,
         out_x_stride: usize,
@@ -218,6 +251,7 @@ impl PyAllToAllContext {
         self.ctx
             .dispatch_recv(
                 slot,
+                generation,
                 out_num_tokens_ptr as *mut i32,
                 out_x_ptr as *mut c_void,
                 out_x_stride,
@@ -233,12 +267,19 @@ impl PyAllToAllContext {
     fn combine_send(
         &mut self,
         slot: usize,
+        generation: u64,
         expert_x_ptr: u64,
         expert_x_stride: usize,
         stream: u64,
     ) -> PyResult<()> {
         self.ctx
-            .combine_send(slot, expert_x_ptr as *const c_void, expert_x_stride, stream)
+            .combine_send(
+                slot,
+                generation,
+                expert_x_ptr as *const c_void,
+                expert_x_stride,
+                stream,
+            )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -246,6 +287,7 @@ impl PyAllToAllContext {
     fn combine_recv(
         &mut self,
         slot: usize,
+        generation: u64,
         num_tokens: usize,
         num_recv_tokens: usize,
         expert_y_dtype: ScalarType,
@@ -262,6 +304,7 @@ impl PyAllToAllContext {
         self.ctx
             .combine_recv(
                 slot,
+                generation,
                 num_tokens,
                 num_recv_tokens,
                 expert_y_dtype,

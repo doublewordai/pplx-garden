@@ -58,9 +58,11 @@ def make_rng(device: torch.device, rank: int) -> torch.Generator:
 
 @dataclass(slots=True)
 class AllToAllConfig:
+    api: str
     nets_per_gpu: int
     max_num_tokens: int
-    max_private_tokens: int
+    max_tokens_per_expert: Optional[int]
+    max_private_tokens: Optional[int]
     num_experts: int
     hidden_dim: int
     hidden_dim_scale: Optional[int]
@@ -104,6 +106,9 @@ class AllToAllResource:
             cfg.num_experts // global_group.size
         )
         self.num_tokens = num_tokens = num_dp_groups * cfg.max_num_tokens
+        self.ll_max_tokens_per_expert = cfg.max_tokens_per_expert
+        if self.ll_max_tokens_per_expert is None and cfg.api == "low-latency":
+            self.ll_max_tokens_per_expert = num_tokens
         max_recv_tokens = round_up(
             max(
                 min(
@@ -138,6 +143,7 @@ class AllToAllResource:
             dp_group=dp_group,
             node_group=node_group,
             global_group=global_group,
+            max_tokens_per_expert=self.ll_max_tokens_per_expert,
         )
 
         # Allocate buffers.
@@ -161,6 +167,17 @@ class AllToAllResource:
             dtype=cfg.out_dtype,
             device=device,
         )
+        self.ll_expert_y: torch.Tensor | None = None
+        if self.ll_max_tokens_per_expert is not None:
+            self.ll_expert_y = torch.empty(
+                (
+                    num_local_experts,
+                    self.ll_max_tokens_per_expert,
+                    cfg.hidden_dim,
+                ),
+                dtype=cfg.out_dtype,
+                device=device,
+            )
         self.out_expert_x_scale: torch.Tensor | None = None
         if cfg.hidden_dim_scale is not None or cfg.scale_dtype is not None:
             assert cfg.scale_dtype is not None
@@ -206,23 +223,62 @@ def correctness_check(r: AllToAllResource) -> None:
     ref_out_tokens = act(local_rank.dp_x, local_rank.dp_x_scale).to(r.cfg.out_dtype)
 
     # Test run.
-    r.all_to_all.dispatch(
-        out_expert_num_tokens=r.expert_num_tokens,
-        out_expert_x=r.out_expert_x,
-        out_expert_x_scale=r.out_expert_x_scale,
-        dp_x=local_rank.dp_x,
-        dp_x_scale=local_rank.dp_x_scale,
-        indices=local_rank.indices,
-        weights=local_rank.weights,
-    )
-    expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
-    r.all_to_all.combine(
-        out_tokens=r.out_tokens,
-        indices=local_rank.indices,
-        weights=local_rank.weights,
-        expert_y=expert_y,
-        bound_m=local_rank.bound_m,
-    )
+    if r.cfg.api == "low-latency":
+        (
+            expert_x,
+            expert_x_scale,
+            expert_num_tokens,
+            dispatch_handle,
+            dispatch_recv,
+        ) = r.all_to_all.low_latency_dispatch(
+            local_rank.dp_x,
+            local_rank.indices,
+            local_rank.weights,
+            local_rank.dp_x_scale,
+            slot_key=0,
+        )
+        dispatch_recv()
+        expert_y = act(
+            expert_x.reshape(-1, r.cfg.hidden_dim),
+            (
+                None
+                if expert_x_scale is None
+                else expert_x_scale.reshape(-1, r.cfg.hidden_dim_scale)
+            ),
+        ).to(r.cfg.out_dtype)
+        expert_y = expert_y.reshape_as(expert_x).to(r.cfg.out_dtype)
+        _combine_handle, combine_recv = r.all_to_all.low_latency_combine(
+            expert_y,
+            dispatch_handle,
+            out=r.out_tokens,
+            bound_m=local_rank.bound_m,
+        )
+        combine_recv()
+        r.expert_num_tokens.copy_(expert_num_tokens)
+        r.out_expert_x = expert_x.reshape(-1, r.cfg.hidden_dim)
+        r.out_expert_x_scale = (
+            None
+            if expert_x_scale is None
+            else expert_x_scale.reshape(-1, r.cfg.hidden_dim_scale)
+        )
+    else:
+        r.all_to_all.dispatch(
+            out_expert_num_tokens=r.expert_num_tokens,
+            out_expert_x=r.out_expert_x,
+            out_expert_x_scale=r.out_expert_x_scale,
+            dp_x=local_rank.dp_x,
+            dp_x_scale=local_rank.dp_x_scale,
+            indices=local_rank.indices,
+            weights=local_rank.weights,
+        )
+        expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
+        r.all_to_all.combine(
+            out_tokens=r.out_tokens,
+            indices=local_rank.indices,
+            weights=local_rank.weights,
+            expert_y=expert_y,
+            bound_m=local_rank.bound_m,
+        )
     torch.cuda.synchronize()
 
     # Verify the token counts.
@@ -236,12 +292,22 @@ def correctness_check(r: AllToAllResource) -> None:
         return ",".join(f"{v:.2f}" for v in x.tolist())
 
     tokens_on_rank = set()
-    index = 0
-    for n in expected_local_tokens.tolist():
-        for token in r.out_expert_x[index : index + n]:
-            tokens_on_rank.add(hash_token(token))
+    if r.cfg.api == "low-latency":
+        assert r.ll_max_tokens_per_expert is not None
+        starts = [
+            local_expert * r.ll_max_tokens_per_expert
+            for local_expert in range(r.num_local_experts)
+        ]
+    else:
+        starts = []
+        index = 0
+        for n in expected_local_tokens.tolist():
+            starts.append(index)
+            index = round_up(index + n, r.expert_padding)
 
-        index = round_up(index + n, r.expert_padding)
+    for start, n in zip(starts, expected_local_tokens.tolist()):
+        for token in r.out_expert_x[start : start + n]:
+            tokens_on_rank.add(hash_token(token))
 
     # Verify the tokens on the rank.
     num_missing = 0
@@ -274,29 +340,61 @@ def benchmark(
     rng = make_rng(r.device, r.dp_rank)
 
     def dispatch() -> None:
-        r.all_to_all.dispatch(
-            out_expert_num_tokens=r.expert_num_tokens,
-            out_expert_x=r.out_expert_x,
-            out_expert_x_scale=r.out_expert_x_scale,
-            dp_x=local_rank.dp_x,
-            dp_x_scale=local_rank.dp_x_scale,
-            indices=local_rank.indices,
-            weights=local_rank.weights,
-            bound_m=local_rank.bound_m,
-            do_send=True,
-            do_recv=True,
-        )
+        nonlocal dispatch_handle
+        if r.cfg.api == "low-latency":
+            (
+                _expert_x,
+                _expert_x_scale,
+                _expert_num_tokens,
+                dispatch_handle,
+                recv,
+            ) = r.all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
+            )
+            recv()
+        else:
+            r.all_to_all.dispatch(
+                out_expert_num_tokens=r.expert_num_tokens,
+                out_expert_x=r.out_expert_x,
+                out_expert_x_scale=r.out_expert_x_scale,
+                dp_x=local_rank.dp_x,
+                dp_x_scale=local_rank.dp_x_scale,
+                indices=local_rank.indices,
+                weights=local_rank.weights,
+                bound_m=local_rank.bound_m,
+                do_send=True,
+                do_recv=True,
+            )
 
     def combine() -> None:
-        r.all_to_all.combine(
-            out_tokens=r.out_tokens,
-            indices=local_rank.indices,
-            weights=local_rank.weights,
-            expert_y=r.expert_y,
-            bound_m=local_rank.bound_m,
-            do_send=True,
-            do_recv=True,
-        )
+        nonlocal dispatch_handle
+        if r.cfg.api == "low-latency":
+            assert dispatch_handle is not None
+            assert r.ll_expert_y is not None
+            _combine_handle, recv = r.all_to_all.low_latency_combine(
+                r.ll_expert_y,
+                dispatch_handle,
+                out=r.out_tokens,
+                bound_m=local_rank.bound_m,
+            )
+            recv()
+            dispatch_handle = None
+        else:
+            r.all_to_all.combine(
+                out_tokens=r.out_tokens,
+                indices=local_rank.indices,
+                weights=local_rank.weights,
+                expert_y=r.expert_y,
+                bound_m=local_rank.bound_m,
+                do_send=True,
+                do_recv=True,
+            )
+
+    dispatch_handle = None
 
     # Combined Benchmark Events
     dispatch_events = []
@@ -423,6 +521,7 @@ def benchmark(
 
         logger.info("============================================================")
         logger.info("P2P All-to-All Link Performance Report")
+        logger.info("API: %s", r.cfg.api)
         logger.info("============================================================")
         logger.info("Dispatch time: %s, %.1f GB/s", stat_dispatch, dispatch_bandwidth)
         logger.info("  - Local Loopback:  %6.2f MB (%5.1f%%)", avg_local_disp_bytes / 1e6, avg_local_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0)
@@ -600,9 +699,16 @@ def main() -> None:
     parser.add_argument("--node-rank", type=int, default=0)
     parser.add_argument("--num-warmup", type=int, default=10000)
     parser.add_argument("--num-repeats", type=int, default=10000)
+    parser.add_argument(
+        "--api",
+        choices=("legacy", "low-latency"),
+        default="legacy",
+        help="API surface to benchmark",
+    )
     parser.add_argument("--nets-per-gpu", type=int, default=2)
     parser.add_argument("--max-num-tokens", type=int, default=128)
-    parser.add_argument("--max-private-tokens", type=int, default=256)
+    parser.add_argument("--max-tokens-per-expert", type=optional_int, default=None)
+    parser.add_argument("--max-private-tokens", type=optional_int, default=256)
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--hidden-dim-scale", type=int, default=56)
@@ -621,8 +727,10 @@ def main() -> None:
     args = parser.parse_args()
 
     config = AllToAllConfig(
+        api=args.api,
         nets_per_gpu=args.nets_per_gpu,
         max_num_tokens=args.max_num_tokens,
+        max_tokens_per_expert=args.max_tokens_per_expert,
         max_private_tokens=args.max_private_tokens,
         num_experts=args.num_experts,
         hidden_dim=args.hidden_dim,

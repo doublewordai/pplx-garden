@@ -7,7 +7,10 @@ import pytest
 import torch
 
 from pplx_garden.distributed import ParallelGroup, ParallelLaunch
-from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
+from pplx_garden.kernels.p2p_all_to_all import (
+    P2PAllToAll,
+    reset_all_cuda_graph_capture_slots,
+)
 from pplx_garden.utils import logging_utils
 from pplx_garden.utils.math import round_up
 from pplx_garden.utils.torch import has_tp
@@ -95,7 +98,9 @@ def _test_dbo_smoke_worker(
 
     num_local_experts = num_experts // num_dp_groups
     first_expert = dp_rank * num_local_experts
-    max_recv_tokens = max_num_tokens * num_local_experts * num_dp_groups
+    ll_max_tokens_per_expert = config.max_tokens_per_expert
+    if ll_max_tokens_per_expert is None:
+        ll_max_tokens_per_expert = max_num_tokens * global_group.size
 
     # Create dummy data for Batch A and Batch B with distinct seeds
     generator_a = torch.Generator(device=device)
@@ -153,7 +158,7 @@ def _test_dbo_smoke_worker(
         dp_group=tp_group,
         node_group=node_group,
         global_group=global_group,
-        max_tokens_per_expert=config.max_tokens_per_expert,
+        max_tokens_per_expert=ll_max_tokens_per_expert,
     )
 
     try:
@@ -161,14 +166,11 @@ def _test_dbo_smoke_worker(
         expert_num_tokens_a = torch.empty(
             (num_local_experts,), dtype=torch.int32, device=device
         )
-        if config.max_tokens_per_expert is None:
-            out_expert_x_shape_a = (max_recv_tokens, hidden_dim)
-        else:
-            out_expert_x_shape_a = (
-                num_local_experts,
-                config.max_tokens_per_expert,
-                hidden_dim,
-            )
+        out_expert_x_shape_a = (
+            num_local_experts,
+            ll_max_tokens_per_expert,
+            hidden_dim,
+        )
         out_expert_x_a = torch.empty(
             out_expert_x_shape_a, dtype=in_dtype, device=device
         )
@@ -177,14 +179,11 @@ def _test_dbo_smoke_worker(
         )
 
         if hidden_dim_scale is not None or scale_dtype is not None:
-            if config.max_tokens_per_expert is None:
-                out_expert_x_scale_shape_a = (max_recv_tokens, hidden_dim_scale)
-            else:
-                out_expert_x_scale_shape_a = (
-                    num_local_experts,
-                    config.max_tokens_per_expert,
-                    hidden_dim_scale,
-                )
+            out_expert_x_scale_shape_a = (
+                num_local_experts,
+                ll_max_tokens_per_expert,
+                hidden_dim_scale,
+            )
             out_expert_x_scale_a = torch.empty(
                 out_expert_x_scale_shape_a, dtype=scale_dtype, device=device
             )
@@ -195,14 +194,11 @@ def _test_dbo_smoke_worker(
         expert_num_tokens_b = torch.empty(
             (num_local_experts,), dtype=torch.int32, device=device
         )
-        if config.max_tokens_per_expert is None:
-            out_expert_x_shape_b = (max_recv_tokens, hidden_dim)
-        else:
-            out_expert_x_shape_b = (
-                num_local_experts,
-                config.max_tokens_per_expert,
-                hidden_dim,
-            )
+        out_expert_x_shape_b = (
+            num_local_experts,
+            ll_max_tokens_per_expert,
+            hidden_dim,
+        )
         out_expert_x_b = torch.empty(
             out_expert_x_shape_b, dtype=in_dtype, device=device
         )
@@ -211,14 +207,11 @@ def _test_dbo_smoke_worker(
         )
 
         if hidden_dim_scale is not None or scale_dtype is not None:
-            if config.max_tokens_per_expert is None:
-                out_expert_x_scale_shape_b = (max_recv_tokens, hidden_dim_scale)
-            else:
-                out_expert_x_scale_shape_b = (
-                    num_local_experts,
-                    config.max_tokens_per_expert,
-                    hidden_dim_scale,
-                )
+            out_expert_x_scale_shape_b = (
+                num_local_experts,
+                ll_max_tokens_per_expert,
+                hidden_dim_scale,
+            )
             out_expert_x_scale_b = torch.empty(
                 out_expert_x_scale_shape_b, dtype=scale_dtype, device=device
             )
@@ -249,6 +242,21 @@ def _test_dbo_smoke_worker(
             indices=data_a.indices,
             weights=data_a.weights,
             bound_m=None,
+        )
+        torch.cuda.synchronize()
+        assert_canonical_batched_experts_layout(
+            out_expert_x=ref_out_expert_x_a,
+            out_expert_x_scale=ref_out_expert_x_scale_a,
+            expert_num_tokens=ref_expert_num_tokens_a,
+            rank_data=rank_data_a,
+            first_expert=first_expert,
+            num_local_experts=num_local_experts,
+            rank=global_group.rank,
+            dp_size=tp_group.size,
+            node_size=node_group.size if node_group is not None else tp_group.size,
+            world_size=global_group.size,
+            expert_padding=config.expert_padding,
+            max_tokens_per_expert=ll_max_tokens_per_expert,
         )
         ref_expert_y_a = _expert_forward(
             ref_out_expert_x_a, ref_out_expert_x_scale_a, out_dtype
@@ -282,6 +290,21 @@ def _test_dbo_smoke_worker(
             weights=data_b.weights,
             bound_m=None,
         )
+        torch.cuda.synchronize()
+        assert_canonical_batched_experts_layout(
+            out_expert_x=ref_out_expert_x_b,
+            out_expert_x_scale=ref_out_expert_x_scale_b,
+            expert_num_tokens=ref_expert_num_tokens_b,
+            rank_data=rank_data_b,
+            first_expert=first_expert,
+            num_local_experts=num_local_experts,
+            rank=global_group.rank,
+            dp_size=tp_group.size,
+            node_size=node_group.size if node_group is not None else tp_group.size,
+            world_size=global_group.size,
+            expert_padding=config.expert_padding,
+            max_tokens_per_expert=ll_max_tokens_per_expert,
+        )
         ref_expert_y_b = _expert_forward(
             ref_out_expert_x_b, ref_out_expert_x_scale_b, out_dtype
         )
@@ -311,47 +334,83 @@ def _test_dbo_smoke_worker(
         # Objective: overlap Slot A's computation with Slot B's background communication.
 
         # [STAGE 1] Trigger Async Dispatch on Batch A
-        dispatch_handle_a = all_to_all.dispatch_async(
-            out_expert_num_tokens=expert_num_tokens_a,
-            out_expert_x=out_expert_x_a,
-            out_expert_x_scale=out_expert_x_scale_a,
-            dp_x=data_a.dp_x,
-            dp_x_scale=data_a.dp_x_scale,
-            indices=data_a.indices,
-            weights=data_a.weights,
-            bound_m=None,
+        (
+            out_expert_x_a,
+            out_expert_x_scale_a,
+            expert_num_tokens_a,
+            dispatch_handle_a,
+            dispatch_recv_a,
+        ) = all_to_all.low_latency_dispatch(
+            data_a.dp_x,
+            data_a.indices,
+            data_a.weights,
+            data_a.dp_x_scale,
+            slot_key=0,
         )
 
         ## Previous B compute goes here, i.e. Q/K Proj
 
         # [STAGE 2] Wait/Sync on Batch A's dispatch completion so we can start its compute
-        dispatch_handle_a.recv()
+        dispatch_recv_a()
+        torch.cuda.synchronize()
+        assert_canonical_batched_experts_layout(
+            out_expert_x=out_expert_x_a,
+            out_expert_x_scale=out_expert_x_scale_a,
+            expert_num_tokens=expert_num_tokens_a,
+            rank_data=rank_data_a,
+            first_expert=first_expert,
+            num_local_experts=num_local_experts,
+            rank=global_group.rank,
+            dp_size=tp_group.size,
+            node_size=node_group.size if node_group is not None else tp_group.size,
+            world_size=global_group.size,
+            expert_padding=config.expert_padding,
+            max_tokens_per_expert=ll_max_tokens_per_expert,
+        )
 
         # [STAGE 3] OVERLAP STEP: Kick off Async Dispatch on Batch B, and while it transmits,
         # run local expert forward computation on Batch A.
-        dispatch_handle_b = all_to_all.dispatch_async(
-            out_expert_num_tokens=expert_num_tokens_b,
-            out_expert_x=out_expert_x_b,
-            out_expert_x_scale=out_expert_x_scale_b,
-            dp_x=data_b.dp_x,
-            dp_x_scale=data_b.dp_x_scale,
-            indices=data_b.indices,
-            weights=data_b.weights,
-            bound_m=None,
+        (
+            out_expert_x_b,
+            out_expert_x_scale_b,
+            expert_num_tokens_b,
+            dispatch_handle_b,
+            dispatch_recv_b,
+        ) = all_to_all.low_latency_dispatch(
+            data_b.dp_x,
+            data_b.indices,
+            data_b.weights,
+            data_b.dp_x_scale,
+            slot_key=1,
         )
 
         # --- Local Computation on Batch A (Overlapped with Dispatch B transfer) ---
         expert_y_a = _expert_forward(out_expert_x_a, out_expert_x_scale_a, out_dtype)
 
         # [STAGE 4] Wait/Sync on Batch B's dispatch completion
-        dispatch_handle_b.recv()
+        dispatch_recv_b()
+        torch.cuda.synchronize()
+        assert_canonical_batched_experts_layout(
+            out_expert_x=out_expert_x_b,
+            out_expert_x_scale=out_expert_x_scale_b,
+            expert_num_tokens=expert_num_tokens_b,
+            rank_data=rank_data_b,
+            first_expert=first_expert,
+            num_local_experts=num_local_experts,
+            rank=global_group.rank,
+            dp_size=tp_group.size,
+            node_size=node_group.size if node_group is not None else tp_group.size,
+            world_size=global_group.size,
+            expert_padding=config.expert_padding,
+            max_tokens_per_expert=ll_max_tokens_per_expert,
+        )
 
         # [STAGE 5] OVERLAP STEP: Kick off Async Combine on Batch A, and while it transmits,
         # run local expert forward computation on Batch B.
-        combine_handle_a = all_to_all.combine_async(
-            out_tokens=out_tokens_a,
-            dispatch_handle=dispatch_handle_a,
-            expert_y=expert_y_a,
+        _combine_handle_a, combine_recv_a = all_to_all.low_latency_combine(
+            expert_y_a,
+            dispatch_handle_a,
+            out=out_tokens_a,
             bound_m=data_a.bound_m,
         )
 
@@ -359,23 +418,23 @@ def _test_dbo_smoke_worker(
         expert_y_b = _expert_forward(out_expert_x_b, out_expert_x_scale_b, out_dtype)
 
         # [STAGE 6] Wait/Sync on Batch A's combine completion.
-        combine_handle_a.recv()
+        combine_recv_a()
         # Batch A is now fully complete!
 
         # [STAGE 7] Kick off Async Combine on Batch B.
         # Since this is the end of our microbatch stream, we can optionally overlap this
         # with downstream consumer logic, or simply wait on it.
-        combine_handle_b = all_to_all.combine_async(
-            out_tokens=out_tokens_b,
-            dispatch_handle=dispatch_handle_b,
-            expert_y=expert_y_b,
+        _combine_handle_b, combine_recv_b = all_to_all.low_latency_combine(
+            expert_y_b,
+            dispatch_handle_b,
+            out=out_tokens_b,
             bound_m=data_b.bound_m,
         )
 
         # Downstream compute goes here: i.e. MLA proj
 
         # Wait/Sync on Batch B's combine completion.
-        combine_handle_b.recv()
+        combine_recv_b()
         # Batch B is now fully complete!
 
         torch.cuda.synchronize()
@@ -389,6 +448,87 @@ def _test_dbo_smoke_worker(
         torch.testing.assert_close(out_tokens_b, ref_out_tokens_b)
         torch.testing.assert_close(expert_num_tokens_a, ref_expert_num_tokens_a)
         torch.testing.assert_close(expert_num_tokens_b, ref_expert_num_tokens_b)
+
+        # ----------------------------------------------------
+        # 4. CUDA GRAPH CAPTURE/REPLAY GATE
+        # ----------------------------------------------------
+        # Capture the same two-slot LL dispatch/compute/combine sequence. During
+        # capture the host only records launches; the worker observes the device
+        # flags on replay, so replay must happen before any further slot reuse.
+        assert out_expert_x_scale_a is None
+        assert out_expert_x_scale_b is None
+        assert data_a.dp_x_scale is None
+        assert data_b.dp_x_scale is None
+
+        graph_out_tokens_a = torch.empty_like(out_tokens_a)
+        graph_out_tokens_b = torch.empty_like(out_tokens_b)
+        graph_expert_y_a = torch.empty_like(out_expert_x_a, dtype=out_dtype)
+        graph_expert_y_b = torch.empty_like(out_expert_x_b, dtype=out_dtype)
+        graph_out_tokens_a.zero_()
+        graph_out_tokens_b.zero_()
+        graph_expert_y_a.zero_()
+        graph_expert_y_b.zero_()
+        torch.cuda.synchronize()
+
+        reset_all_cuda_graph_capture_slots()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            (
+                graph_expert_x_a,
+                _graph_expert_x_scale_a,
+                _graph_expert_num_tokens_a,
+                graph_dispatch_handle_a,
+                graph_dispatch_recv_a,
+            ) = all_to_all.low_latency_dispatch(
+                data_a.dp_x,
+                data_a.indices,
+                data_a.weights,
+                data_a.dp_x_scale,
+                slot_key=0,
+            )
+            graph_dispatch_recv_a()
+            torch.mul(graph_expert_x_a, 2, out=graph_expert_y_a)
+
+            (
+                graph_expert_x_b,
+                _graph_expert_x_scale_b,
+                _graph_expert_num_tokens_b,
+                graph_dispatch_handle_b,
+                graph_dispatch_recv_b,
+            ) = all_to_all.low_latency_dispatch(
+                data_b.dp_x,
+                data_b.indices,
+                data_b.weights,
+                data_b.dp_x_scale,
+                slot_key=1,
+            )
+            graph_dispatch_recv_b()
+            torch.mul(graph_expert_x_b, 2, out=graph_expert_y_b)
+
+            _graph_combine_handle_a, graph_combine_recv_a = (
+                all_to_all.low_latency_combine(
+                    graph_expert_y_a,
+                    graph_dispatch_handle_a,
+                    out=graph_out_tokens_a,
+                    bound_m=data_a.bound_m,
+                )
+            )
+            graph_combine_recv_a()
+
+            _graph_combine_handle_b, graph_combine_recv_b = (
+                all_to_all.low_latency_combine(
+                    graph_expert_y_b,
+                    graph_dispatch_handle_b,
+                    out=graph_out_tokens_b,
+                    bound_m=data_b.bound_m,
+                )
+            )
+            graph_combine_recv_b()
+
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_out_tokens_a, ref_out_tokens_a)
+        torch.testing.assert_close(graph_out_tokens_b, ref_out_tokens_b)
 
     except Exception:
         logger.exception("DBO smoke test failed")
