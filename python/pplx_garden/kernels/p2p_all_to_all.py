@@ -106,15 +106,12 @@ class _LowLatencyWorkspacePool:
     def __init__(self) -> None:
         self._entries: dict[int, _LowLatencyWorkspaceEntry] = {}
 
-    def acquire(
+    def _layout_offsets(
         self,
-        *,
-        key: int,
-        device: torch.device,
         activation_dtype: torch.dtype,
         scale_dtype: Optional[torch.dtype],
         layout: dict[str, Any],
-    ) -> _LowLatencyWorkspaceLease:
+    ) -> tuple[dict[str, tuple[int, int, tuple[int, ...], torch.dtype]], int]:
         dtype_map = {
             "activation": activation_dtype,
             "scale": scale_dtype,
@@ -142,8 +139,20 @@ class _LowLatencyWorkspacePool:
                     f"nbytes for {name}: expected={expected_nbytes} got={nbytes}"
                 )
             offsets[name] = (int(spec["offset_bytes"]), nbytes, shape, dtype)
-        total_bytes = int(layout["total_bytes"])
+        return offsets, int(layout["total_bytes"])
 
+    def ensure(
+        self,
+        *,
+        key: int,
+        device: torch.device,
+        activation_dtype: torch.dtype,
+        scale_dtype: Optional[torch.dtype],
+        layout: dict[str, Any],
+    ) -> _LowLatencyWorkspaceEntry:
+        offsets, total_bytes = self._layout_offsets(
+            activation_dtype, scale_dtype, layout
+        )
         entry = self._entries.get(key)
         current_bytes = 0 if entry is None else entry.capacity_bytes
         if entry is not None and entry.in_use:
@@ -182,6 +191,27 @@ class _LowLatencyWorkspacePool:
                 activation_dtype,
             )
         assert entry is not None
+        return entry
+
+    def acquire(
+        self,
+        *,
+        key: int,
+        device: torch.device,
+        activation_dtype: torch.dtype,
+        scale_dtype: Optional[torch.dtype],
+        layout: dict[str, Any],
+    ) -> _LowLatencyWorkspaceLease:
+        offsets, _total_bytes = self._layout_offsets(
+            activation_dtype, scale_dtype, layout
+        )
+        entry = self.ensure(
+            key=key,
+            device=device,
+            activation_dtype=activation_dtype,
+            scale_dtype=scale_dtype,
+            layout=layout,
+        )
         entry.in_use = True
         storage = entry.storage
 
@@ -207,6 +237,9 @@ class _LowLatencyWorkspacePool:
         entry = self._entries.get(key)
         if entry is not None:
             entry.in_use = False
+
+    def clear(self) -> None:
+        self._entries.clear()
 
 
 @dataclass
@@ -770,6 +803,14 @@ class P2PAllToAll(AllToAllKernel):
         self._low_latency_workspace_layout["num_max_dispatch_tokens_per_rank"] = (
             self._num_max_dispatch_tokens_per_rank
         )
+        for slot in range(self._num_slots):
+            self._low_latency_workspace_pool.ensure(
+                key=slot,
+                device=self._device,
+                activation_dtype=self._in_dtype,
+                scale_dtype=self._scale_dtype,
+                layout=self._low_latency_workspace_layout,
+            )
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()
@@ -1457,6 +1498,7 @@ class P2PAllToAll(AllToAllKernel):
         self._global_group.barrier()
         self._all_to_all = None
         self._low_latency_workspace_layout = None
+        self._low_latency_workspace_pool.clear()
 
         # Stop the transfer engine once no rank is active.
         self._global_group.barrier()
