@@ -108,6 +108,8 @@ struct DeviceWorkspace {
     send_ptrs: Option<CudaDeviceMemory>,
     /// Device-side recv pointers.
     recv_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency workspace base pointers for same-node peers.
+    low_latency_workspace_ptrs: Option<CudaDeviceMemory>,
 }
 
 impl DeviceWorkspace {
@@ -174,6 +176,7 @@ impl DeviceWorkspace {
             sync_ptrs,
             send_ptrs,
             recv_ptrs,
+            low_latency_workspace_ptrs: None,
         })
     }
 
@@ -187,6 +190,20 @@ impl DeviceWorkspace {
 
     fn get_send_ptr(&mut self) -> *mut *mut c_void {
         self.send_ptrs.as_mut().map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    fn set_low_latency_workspace_ptrs(
+        &mut self,
+        host_workspace_ptrs: &[u64],
+    ) -> Result<(), CudartError> {
+        self.low_latency_workspace_ptrs =
+            Some(CudaDeviceMemory::from_vec(host_workspace_ptrs)?);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn get_low_latency_workspace_ptr(&mut self) -> *mut *mut c_void {
+        self.low_latency_workspace_ptrs.as_mut().map_or(null_mut(), |p| p.get_mut_ptr())
     }
 }
 
@@ -481,6 +498,41 @@ impl AllToAllContext {
         self.workspaces
             .get_mut(slot)
             .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
+    }
+
+    pub fn set_low_latency_workspace_ptrs(
+        &mut self,
+        workspace_ptrs: Vec<Vec<u64>>,
+    ) -> Result<()> {
+        if workspace_ptrs.len() != self.workspaces.len() {
+            return Err(anyhow!(
+                "Expected {} low-latency workspace pointer sets, got {}",
+                self.workspaces.len(),
+                workspace_ptrs.len()
+            ));
+        }
+        for (slot, slot_ptrs) in workspace_ptrs.iter().enumerate() {
+            if slot_ptrs.len() != self.node_size {
+                return Err(anyhow!(
+                    "Expected {} low-latency workspace pointers for slot {}, got {}",
+                    self.node_size,
+                    slot,
+                    slot_ptrs.len()
+                ));
+            }
+            if slot_ptrs.contains(&0) {
+                return Err(anyhow!(
+                    "Low-latency workspace pointer set for slot {} contains null",
+                    slot
+                ));
+            }
+        }
+        for (workspace, slot_ptrs) in
+            self.workspaces.iter_mut().zip(workspace_ptrs.iter())
+        {
+            workspace.set_low_latency_workspace_ptrs(slot_ptrs)?;
+        }
+        Ok(())
     }
 
     fn slot_state(&self, slot: usize) -> Result<&Mutex<SlotGenerationState>> {

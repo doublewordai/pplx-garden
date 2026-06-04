@@ -883,6 +883,9 @@ class P2PAllToAll(AllToAllKernel):
                 [self._low_latency_workspace_pool.local_mapping(slot).data_ptr()]
                 for slot in range(self._num_slots)
             ]
+        self._all_to_all.set_low_latency_workspace_ptrs(
+            self._low_latency_workspace_ptrs
+        )
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()

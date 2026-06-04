@@ -284,6 +284,18 @@ impl PyAllToAllContext {
         self.ctx.uses_node_route_exchange()
     }
 
+    fn set_low_latency_workspace_ptrs(
+        &mut self,
+        workspace_ptrs: Vec<Vec<u64>>,
+    ) -> PyResult<()> {
+        self.ctx.set_low_latency_workspace_ptrs(workspace_ptrs).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to set low-latency workspace pointers: {}",
+                e
+            ))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_recv(
         &mut self,
