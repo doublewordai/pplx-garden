@@ -70,10 +70,27 @@ class AllToAllContext:
         weights_stride: int,
         bound_m_ptr: int | None,
         stream: int,
-    ) -> int: ...
+    ) -> dict[str, int]: ...
+    def dispatch_send_on_slot(
+        self,
+        slot: int,
+        num_tokens: int,
+        x_ptr: int,
+        x_stride: int,
+        x_scale_ptr: int | None,
+        x_scale_stride_elem: int | None,
+        x_scale_stride_token: int | None,
+        indices_ptr: int,
+        indices_stride: int,
+        weights_ptr: int,
+        weights_stride: int,
+        bound_m_ptr: int | None,
+        stream: int,
+    ) -> dict[str, int]: ...
     def dispatch_recv(
         self,
         slot: int,
+        generation: int,
         out_num_tokens_ptr: int,
         out_x_ptr: int,
         out_x_stride: int,
@@ -85,6 +102,7 @@ class AllToAllContext:
     def combine_send(
         self,
         slot: int,
+        generation: int,
         expert_x_ptr: int,
         expert_x_stride: int,
         stream: int,
@@ -92,6 +110,7 @@ class AllToAllContext:
     def combine_recv(
         self,
         slot: int,
+        generation: int,
         num_tokens: int,
         num_recv_tokens: int,
         expert_y_dtype: torch.dtype,
@@ -106,3 +125,4 @@ class AllToAllContext:
         stream: int,
     ) -> None: ...
     def get_perf_stats(self) -> dict[str, Any]: ...
+    def uses_node_route_exchange(self) -> bool: ...

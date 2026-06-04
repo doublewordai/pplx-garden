@@ -277,6 +277,10 @@ impl PyAllToAllContext {
         low_latency_route_layout_plan_to_dict(py, plan)
     }
 
+    fn uses_node_route_exchange(&self) -> bool {
+        self.ctx.uses_node_route_exchange()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch_recv(
         &mut self,

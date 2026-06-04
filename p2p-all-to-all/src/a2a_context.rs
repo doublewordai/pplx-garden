@@ -1205,6 +1205,12 @@ impl AllToAllContext {
         stats
     }
 
+    pub fn uses_node_route_exchange(&self) -> bool {
+        self.workers
+            .first()
+            .is_some_and(|worker| worker.has_node_route_exchange())
+    }
+
     pub fn debug_low_latency_route_layout_plan(
         &self,
         num_routed: Vec<Vec<u32>>,

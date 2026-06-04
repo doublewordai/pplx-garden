@@ -252,6 +252,14 @@ def _test_p2p_all_to_all_worker(
         # Verify the backend-owned low-latency API used by vLLM's NIXL-like
         # PrepareAndFinalize path.
         if config.max_tokens_per_expert is not None:
+            expected_node_route_exchange = (
+                config.nvlink_group is not None
+                and config.nvlink_group == config.world_size
+            )
+            assert (
+                all_to_all.uses_node_route_exchange()
+                == expected_node_route_exchange
+            )
             (
                 ll_expert_x,
                 ll_expert_x_scale,
@@ -614,6 +622,30 @@ def _test_p2p_all_to_all_worker(
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
             ],
             id="TP4-NIC1-FP32",
+        ),
+        pytest.param(
+            _Config(
+                world_size=4,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=64,
+                num_experts=64,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                max_private_tokens=None,
+                num_experts_per_token=4,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=4,
+                max_tokens_per_expert=128,
+            ),
+            marks=[
+                mark_ci_4gpu,
+                pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
+            ],
+            id="TP4-NIC1-FP32-BATCHED-NVL4",
         ),
         pytest.param(
             _Config(

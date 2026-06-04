@@ -1442,6 +1442,13 @@ class P2PAllToAll(AllToAllKernel):
             dispatch_handle._generation,
         )
 
+    def uses_node_route_exchange(self) -> bool:
+        """Whether this context uses the single-node shared route-count path."""
+
+        if self._all_to_all is None:
+            return False
+        return bool(self._all_to_all.uses_node_route_exchange())
+
     @override
     def destroy(self) -> None:
         """Clean up the all-to-all context."""

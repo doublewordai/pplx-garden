@@ -918,7 +918,7 @@ impl WorkerState {
         .load(Ordering::Relaxed)
     }
 
-    fn has_node_route_exchange(&self) -> bool {
+    pub(crate) fn has_node_route_exchange(&self) -> bool {
         self.world_size == self.node_size
             && self.node_route_count_ptrs.len() == self.world_size
             && self.node_route_epoch_ptrs.len() == self.world_size
