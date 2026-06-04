@@ -332,6 +332,44 @@ def _test_p2p_all_to_all_worker(
                         print("native:", native_route_plan.get(key))
                         print("expected:", expected_route_plan.get(key))
                 assert native_route_plan == expected_route_plan
+
+            (
+                ll_expert_x_interleaved,
+                ll_expert_x_scale_interleaved,
+                ll_expert_num_tokens_interleaved,
+                ll_dispatch_handle_interleaved,
+                ll_dispatch_recv_interleaved,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=1,
+            )
+            assert ll_dispatch_handle_interleaved._slot == 1
+            ll_dispatch_recv_interleaved()
+            torch.cuda.synchronize()
+            assert_canonical_batched_experts_layout(
+                out_expert_x=ll_expert_x_interleaved,
+                out_expert_x_scale=ll_expert_x_scale_interleaved,
+                expert_num_tokens=ll_expert_num_tokens_interleaved,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            assert (
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
+                == expected_route_plan
+            )
+
             if ll_expert_x.dtype == out_dtype:
                 ll_combine_buffer = (
                     all_to_all.get_next_low_latency_combine_buffer(
@@ -371,6 +409,35 @@ def _test_p2p_all_to_all_worker(
 
             with pytest.raises(RuntimeError, match="stale or invalid"):
                 ll_dispatch_handle.debug_route_layout_plan()
+
+            ll_expert_y_interleaved = _act(
+                ll_expert_x_interleaved.reshape(-1, hidden_dim),
+                (
+                    None
+                    if ll_expert_x_scale_interleaved is None
+                    else ll_expert_x_scale_interleaved.reshape(-1, hidden_dim_scale)
+                ),
+            ).to(out_dtype)
+            ll_expert_y_interleaved = ll_expert_y_interleaved.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+            ll_out_tokens_interleaved = torch.empty_like(out_tokens)
+            _ll_combine_handle_interleaved, ll_combine_recv_interleaved = (
+                all_to_all.low_latency_combine(
+                    ll_expert_y_interleaved,
+                    ll_dispatch_handle_interleaved,
+                    out=ll_out_tokens_interleaved,
+                    bound_m=local_rank.bound_m,
+                )
+            )
+            ll_combine_recv_interleaved()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ll_out_tokens_interleaved, ref_out_tokens)
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
 
             (
                 _ll_expert_x_reuse,
