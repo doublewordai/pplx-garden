@@ -1058,6 +1058,7 @@ impl AllToAllContext {
             worker.slot.source_rank.get_device_ptr(),
             worker.slot.source_dispatch_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
+            worker.slot.source_rank_by_final_index.get_device_ptr(),
             worker.slot.source_token_index.get_device_ptr(),
             worker.slot.source_route_index.get_device_ptr(),
             worker.buffers.num_routed_ptr,
@@ -1500,6 +1501,11 @@ impl AllToAllContext {
                 num_ep_groups,
                 self.num_experts.div_ceil(num_ep_groups),
             );
+        plan.source_rank_by_final_index = plan
+            .final_index
+            .iter()
+            .map(|index| worker.slot.source_rank_by_final_index.get(*index as usize))
+            .collect();
         plan.source_token_index = plan
             .final_index
             .iter()

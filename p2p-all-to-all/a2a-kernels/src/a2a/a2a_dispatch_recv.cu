@@ -39,6 +39,7 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ source_rank,
     uint32_t * __restrict__ source_offset,
     uint32_t * __restrict__ padded_index,
+    uint32_t * __restrict__ source_rank_by_final_index,
     uint32_t * __restrict__ source_token_index,
     uint32_t * __restrict__ source_route_index,
     uint32_t * __restrict__ num_routed,
@@ -152,6 +153,7 @@ void a2a_dispatch_recv_kernel(
         auto source_token = source_route_info[0];
         auto source_route = source_route_info[1];
         if (threadIdx.x == 0) {
+            source_rank_by_final_index[padded_token] = token_rank;
             source_token_index[padded_token] = source_token;
             source_route_index[padded_token] = source_route;
         }
@@ -219,6 +221,7 @@ void a2a_dispatch_recv_kernel(
                 auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
                 auto source_token = source_route_info[0];
                 auto source_route = source_route_info[1];
+                source_rank_by_final_index[local_stage[s].dst_index] = source_rank[token];
                 source_token_index[local_stage[s].dst_index] = source_token;
                 source_route_index[local_stage[s].dst_index] = source_route;
             }
@@ -282,6 +285,7 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t *source_rank,
     uint32_t *source_offset,
     uint32_t *padded_index,
+    uint32_t *source_rank_by_final_index,
     uint32_t *source_token_index,
     uint32_t *source_route_index,
     uint32_t *num_routed,
@@ -330,6 +334,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &source_rank,
         &source_offset,
         &padded_index,
+        &source_rank_by_final_index,
         &source_token_index,
         &source_route_index,
         &num_routed,

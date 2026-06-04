@@ -99,6 +99,7 @@ int a2a_dispatch_recv(
     uint32_t *source_rank,
     uint32_t *source_offset,
     uint32_t *padded_index,
+    uint32_t *source_rank_by_final_index,
     uint32_t *source_token_index,
     uint32_t *source_route_index,
     uint32_t *num_routed,
