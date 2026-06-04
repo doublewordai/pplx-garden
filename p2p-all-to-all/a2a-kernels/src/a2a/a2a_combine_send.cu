@@ -96,9 +96,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
             if (num_efa_tokens != 0) {
                 while (ld_mmio_b8(tx_ready) == 0);
             }
-            if (num_efa_tokens == 0) {
-                st_mmio_u32(combine_send_done, epoch);
-            }
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
@@ -173,7 +170,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
 
     grid.sync();
 
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (num_efa_tokens != 0 && blockIdx.x == 0 && threadIdx.x == 0) {
         st_mmio_u32(combine_send_done, epoch);
     }
 
@@ -246,6 +243,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
             if (elect_one_sync()) {
                 *sync_counter = counter + 1;
                 *token_counter = 0;
+                st_mmio_u32(combine_send_done, epoch);
                 if (num_efa_tokens != 0) {
                     *tx_ready = 0;
                 }

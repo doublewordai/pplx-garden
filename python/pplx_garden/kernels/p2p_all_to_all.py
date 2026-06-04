@@ -1276,8 +1276,6 @@ class P2PAllToAll(AllToAllKernel):
             indices.copy_(topk_ids)
             if x_scale is None:
                 dispatch_x_scale = None
-            elif x_scale.is_contiguous():
-                dispatch_x_scale = x_scale
             else:
                 assert lease.dp_x_scale is not None
                 lease.dp_x_scale[:num_tokens].copy_(x_scale)
@@ -1293,11 +1291,8 @@ class P2PAllToAll(AllToAllKernel):
                 dispatch_x = lease.dp_x[:num_tokens]
             else:
                 weights.copy_(topk_weights)
-                if x.is_contiguous():
-                    dispatch_x = x
-                else:
-                    lease.dp_x[:num_tokens].copy_(x)
-                    dispatch_x = lease.dp_x[:num_tokens]
+                lease.dp_x[:num_tokens].copy_(x)
+                dispatch_x = lease.dp_x[:num_tokens]
 
             handle = self.dispatch_async(
                 out_expert_num_tokens=lease.expert_num_tokens,
