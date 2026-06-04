@@ -212,7 +212,8 @@ void a2a_dispatch_recv_kernel(
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
             if (threadIdx.x == 0) {
-                auto source_token = *(uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+                auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+                auto source_token = source_route_info[0];
                 source_token_index[local_stage[s].dst_index] = source_token;
             }
 

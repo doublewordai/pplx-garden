@@ -579,6 +579,7 @@ pub(crate) struct MicrobatchSlot {
     pub(crate) source_rank: GdrVec<u32>,
     pub(crate) padded_index: GdrVec<u32>,
     pub(crate) source_token_index: GdrVec<u32>,
+    pub(crate) combine_recv_position: GdrVec<u32>,
     pub(crate) layout_range: GdrVec<u64>,
     pub(crate) num_recv_tokens: GdrVec<u32>,
     pub(crate) num_recv_tokens_ready: GdrEpoch,
@@ -592,6 +593,8 @@ impl MicrobatchSlot {
         gdr_context: &GdrCopyContext,
         num_local_experts: usize,
         num_ep_groups: usize,
+        max_num_tokens: usize,
+        num_experts_per_token: usize,
         max_recv_tokens: usize,
         max_final_slots: usize,
     ) -> Result<Self> {
@@ -611,6 +614,8 @@ impl MicrobatchSlot {
         let combine_send_offset = GdrVec::new(gdr_context, max_recv_tokens)?;
         let padded_index = GdrVec::new(gdr_context, max_recv_tokens)?;
         let source_token_index = GdrVec::new(gdr_context, max_final_slots)?;
+        let combine_recv_position =
+            GdrVec::new(gdr_context, max_num_tokens * num_experts_per_token)?;
         let layout_range = GdrVec::new(gdr_context, num_local_experts * num_ep_groups)?;
         let num_recv_tokens = GdrVec::new(gdr_context, 3)?;
 
@@ -637,6 +642,7 @@ impl MicrobatchSlot {
             source_rank,
             padded_index,
             source_token_index,
+            combine_recv_position,
             layout_range,
             num_recv_tokens,
             num_recv_tokens_ready,
@@ -776,6 +782,8 @@ impl WorkerState {
             &gdr_context,
             num_local_experts,
             num_ep_groups,
+            max_num_tokens,
+            num_experts_per_token,
             max_recv_tokens,
             if max_tokens_per_expert > 0 {
                 num_local_experts * max_tokens_per_expert

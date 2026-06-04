@@ -139,6 +139,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     uint32_t * __restrict__ token_offset,
     uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ expert_offsets,
+    uint32_t * __restrict__ combine_recv_position,
     uint32_t * __restrict__ dispatch_route_done,
     uint32_t * __restrict__ dispatch_send_done,
     uint8_t * __restrict__ tx_ready,
@@ -180,10 +181,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
 
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
-    auto store_source_token_index = [&](std::byte *token_ptr, uint32_t token) {
+    auto store_source_route_info = [&](std::byte *token_ptr, uint32_t token, uint32_t route) {
         if (threadIdx.x == 0) {
             auto *source_token_index = reinterpret_cast<uint32_t*>(token_ptr + token_dim_bound + token_scale_dim);
             *source_token_index = token;
+            source_token_index[1] = route;
+        }
+    };
+    auto store_combine_recv_position = [&](uint32_t token, uint32_t route, uint32_t position) {
+        if (threadIdx.x == 0) {
+            combine_recv_position[token * num_experts_per_token_bound + route] = position;
         }
     };
 
@@ -317,6 +324,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     #pragma unroll
                     for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                         auto route = expert_iterator[e];
+                    store_combine_recv_position(token, e, route.position);
                         const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
@@ -327,7 +335,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
-                                store_source_token_index(token_ptr, token);
+                                store_source_route_info(token_ptr, token, e);
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -337,7 +345,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             // Always write into the send buffer for local copies.
                             std::byte *token_ptr = send_buffer + route.position * token_stride;
                             uint4 *x_token_dst = (uint4*)token_ptr;
-                            store_source_token_index(token_ptr, token);
+                            store_source_route_info(token_ptr, token, e);
                             st_global_nc_uint4(&x_token_dst[i], val);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -365,6 +373,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
+                    store_combine_recv_position(token, e, route.position);
                     const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
@@ -373,7 +382,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
-                        store_source_token_index(token_ptr, token);
+                        store_source_route_info(token_ptr, token, e);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
@@ -391,6 +400,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
+                    store_combine_recv_position(token, e, route.position);
                     const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
@@ -400,7 +410,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t local_peer = dst_rank % NODE_SIZE;
                         std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
-                        store_source_token_index(token_ptr, token);
+                        store_source_route_info(token_ptr, token, e);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
@@ -450,6 +460,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                 #pragma unroll
                 for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                     auto route = expert_iterator[e];
+                    store_combine_recv_position(token, e, route.position);
                     const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
@@ -460,7 +471,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
-                        store_source_token_index(token_ptr, token);
+                        store_source_route_info(token_ptr, token, e);
                         st_global_nc_uint4(&x_token_dst[i], val);
                         if (has_scale) {
                             *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -502,6 +513,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     #pragma unroll
                     for (unsigned e = 0; e < num_experts_per_token_bound; e++) {
                         auto route = expert_iterator[e];
+                    store_combine_recv_position(token, e, route.position);
                         const uint32_t dst_rank = (route.expert / experts_per_rank) * dp_size + dp_rank;
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
@@ -512,7 +524,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
-                                store_source_token_index(token_ptr, token);
+                                store_source_route_info(token_ptr, token, e);
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -571,6 +583,7 @@ int a2a_kernels::a2a_dispatch_send(
     uint32_t *token_offset,
     uint32_t *num_routed,
     uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
     uint32_t *dispatch_route_done,
     uint32_t *dispatch_send_done,
     uint8_t *tx_ready,
@@ -627,6 +640,7 @@ int a2a_kernels::a2a_dispatch_send(
         &token_offset,
         &num_routed,
         &expert_offsets,
+        &combine_recv_position,
         &dispatch_route_done,
         &dispatch_send_done,
         &tx_ready,

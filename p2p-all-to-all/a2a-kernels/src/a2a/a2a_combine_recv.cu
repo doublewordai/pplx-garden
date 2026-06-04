@@ -39,6 +39,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     std::byte *recv_buffer,
     uint32_t *token_offset,
     uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
     uint8_t *combine_recv_flag,
     uint32_t *combine_recv_done,
     uint32_t *sync_counter,
@@ -71,10 +72,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             const uint32_t global_slot = token * num_experts_per_token + route;
             const uint32_t local_slot = local_token * num_experts_per_token + route;
 
-            const uint32_t expert = indices_ptr[token * indices_stride + route];
-            const uint32_t offset = token_offset[global_slot];
-            const uint32_t position = (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
-            positions[local_slot] = position;
+            positions[local_slot] = combine_recv_position[global_slot];
             i += blockDim.x;
         }
         __syncthreads();
@@ -196,6 +194,7 @@ int a2a_kernels::a2a_combine_recv(
     uint8_t *recv_buffer,
     uint32_t *token_offset,
     uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
     uint8_t *combine_recv_flag,
     uint32_t *combine_recv_done,
     uint32_t *sync_counter,
@@ -227,6 +226,7 @@ int a2a_kernels::a2a_combine_recv(
         &recv_buffer,
         &token_offset,
         &expert_offsets,
+        &combine_recv_position,
         &combine_recv_flag,
         &combine_recv_done,
         &sync_counter,
