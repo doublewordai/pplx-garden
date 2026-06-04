@@ -1822,4 +1822,52 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn low_latency_route_layout_plan_matches_canonical_batched_experts_order() {
+        let num_routed = [
+            [1, 2, 5, 1, 4, 0, 2, 3],
+            [3, 0, 0, 0, 0, 0, 0, 0],
+            [2, 1, 0, 0, 0, 0, 0, 0],
+            [0, 4, 0, 0, 0, 0, 0, 0],
+        ];
+
+        let plan = super::compute_low_latency_route_layout_plan(
+            0,
+            0,
+            1,
+            2,
+            4,
+            8,
+            1,
+            8,
+            2,
+            2,
+            |dp_group, expert| num_routed[dp_group][expert],
+        );
+
+        assert_eq!(plan.source_group_order, vec![2, 3, 1, 0]);
+        assert_eq!(plan.source_group, vec![2, 2, 2, 3, 3, 3, 3, 1, 1, 1, 0, 0, 0]);
+        assert_eq!(plan.source_rank, vec![2, 2, 2, 3, 3, 3, 3, 1, 1, 1, 0, 0, 0]);
+        assert_eq!(plan.final_index, vec![0, 1, 8, 9, 10, 11, 12, 2, 3, 4, 5, 13, 14]);
+        assert_eq!(
+            plan.tokens_per_source_group_per_local_expert,
+            vec![vec![1, 2], vec![3, 0], vec![2, 1], vec![0, 4]]
+        );
+        assert_eq!(plan.tokens_per_expert, vec![6, 7]);
+        assert_eq!(
+            plan.layout_range,
+            vec![
+                super::pack_layout_range(1, 5),
+                super::pack_layout_range(3, 2),
+                super::pack_layout_range(2, 0),
+                super::pack_layout_range(0, 2),
+                super::pack_layout_range(2, 5),
+                super::pack_layout_range(0, 5),
+                super::pack_layout_range(1, 0),
+                super::pack_layout_range(4, 1),
+            ]
+        );
+        assert_eq!(plan.num_recv_tokens, 13);
+    }
 }
