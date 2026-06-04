@@ -219,6 +219,27 @@ class P2PDispatchHandle:
     recv_done_event: Optional[torch.cuda.Event] = None
     recv_done: bool = False
 
+    @property
+    def active_rank_bound(self) -> int:
+        return self.kernel._low_latency_active_rank_bound
+
+    @property
+    def num_max_dispatch_tokens_per_rank(self) -> int:
+        """NIXL-EP-compatible dispatch capacity per source rank."""
+
+        return (
+            self.kernel._num_max_dispatch_tokens_per_rank
+            or self.out_expert_x.shape[1]
+        )
+
+    @property
+    def batched_expert_capacity(self) -> int:
+        return self.out_expert_x.shape[1]
+
+    @property
+    def hidden(self) -> int:
+        return self.out_expert_x.shape[2]
+
     def recv(self) -> None:
         if self.recv_done:
             return
@@ -354,6 +375,20 @@ class P2PAllToAll(AllToAllKernel):
         world_size = global_group.size
         num_dp_groups = world_size // self._dp_size
         self._num_local_experts = ceil_div(num_experts, num_dp_groups)
+        self._low_latency_active_rank_bound = num_dp_groups
+        self._num_max_dispatch_tokens_per_rank: Optional[int] = None
+        if max_tokens_per_expert is not None:
+            if max_tokens_per_expert % num_dp_groups != 0:
+                raise ValueError(
+                    "PPLX low-latency BatchedExperts capacity must match the "
+                    "NIXL-EP layout active_rank_bound * "
+                    "num_max_dispatch_tokens_per_rank: "
+                    f"capacity={max_tokens_per_expert} "
+                    f"active_rank_bound={num_dp_groups}"
+                )
+            self._num_max_dispatch_tokens_per_rank = (
+                max_tokens_per_expert // num_dp_groups
+            )
 
         # Determine the size of the recv buffers.
         avg_tokens_per_expert = int(
@@ -652,6 +687,12 @@ class P2PAllToAll(AllToAllKernel):
         self._low_latency_workspace_layout = (
             self._all_to_all.low_latency_workspace_layout()
         )
+        self._low_latency_workspace_layout["active_rank_bound"] = (
+            self._low_latency_active_rank_bound
+        )
+        self._low_latency_workspace_layout["num_max_dispatch_tokens_per_rank"] = (
+            self._num_max_dispatch_tokens_per_rank
+        )
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
         global_group.barrier()
@@ -946,6 +987,12 @@ class P2PAllToAll(AllToAllKernel):
         ``expert_num_tokens[local_expert]``. Routing tensors and the workspace
         lifetime stay attached to the returned dispatch handle so combine can
         invert the route without ambient mutable state.
+
+        This mirrors the NIXL-EP low-latency contract: dispatch returns the
+        fixed-capacity expert tensor, per-expert counts, an opaque handle, and a
+        receive hook. The current PPLX transport still performs the receive
+        packing in the native recv phase; callers should depend on this
+        contract rather than on the internal staging buffers.
         """
 
         assert self._max_tokens_per_expert is not None
@@ -1064,6 +1111,38 @@ class P2PAllToAll(AllToAllKernel):
             handle,
             handle.recv,
         )
+
+    def get_next_low_latency_combine_buffer(
+        self,
+        dispatch_handle: P2PDispatchHandle,
+    ) -> torch.Tensor:
+        """Return the backend-owned BatchedExperts buffer for combine output.
+
+        This is the PPLX analogue of NIXL-EP's ``get_next_combine_buffer``.
+        It intentionally returns a view that is already tied to the dispatch
+        handle lifetime, so a caller can run expert compute into the buffer and
+        pass it to ``low_latency_combine`` without introducing another
+        graph-size-specific allocation.
+
+        Today this is only zero-copy when the expert output dtype matches the
+        dispatch activation dtype. If those differ, returning a separate Python
+        allocation would violate the low-latency contract; the native transport
+        buffer needs to be exposed instead.
+        """
+
+        lease = dispatch_handle.workspace_lease
+        if lease is None:
+            raise RuntimeError(
+                "PPLX low-latency combine buffer requested after the dispatch "
+                "workspace was released"
+            )
+        if lease.expert_x.dtype != self._out_dtype:
+            raise RuntimeError(
+                "PPLX low-latency combine buffer is only available without an "
+                "extra allocation when expert output dtype matches dispatch "
+                f"dtype: output={self._out_dtype} dispatch={lease.expert_x.dtype}"
+            )
+        return lease.expert_x
 
     @override
     def combine(

@@ -263,6 +263,18 @@ def _test_p2p_all_to_all_worker(
                 slot_key=0,
             )
             assert ll_dispatch_handle._slot == 0
+            assert ll_dispatch_handle.active_rank_bound == (
+                global_group.size // tp_group.size
+            )
+            assert (
+                ll_dispatch_handle.batched_expert_capacity
+                == config.max_tokens_per_expert
+            )
+            assert (
+                ll_dispatch_handle.num_max_dispatch_tokens_per_rank
+                * ll_dispatch_handle.active_rank_bound
+                == ll_dispatch_handle.batched_expert_capacity
+            )
             ll_dispatch_recv()
             torch.cuda.synchronize()
             with pytest.raises(RuntimeError, match="already in use"):
@@ -289,6 +301,19 @@ def _test_p2p_all_to_all_worker(
                 expert_padding=config.expert_padding,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
+            if ll_expert_x.dtype == out_dtype:
+                ll_combine_buffer = (
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle
+                    )
+                )
+                assert ll_combine_buffer.data_ptr() == ll_expert_x.data_ptr()
+                assert ll_combine_buffer.shape == ll_expert_x.shape
+            else:
+                with pytest.raises(RuntimeError, match="without an extra allocation"):
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle
+                    )
             ll_expert_y = _act(
                 ll_expert_x.reshape(-1, hidden_dim),
                 (
