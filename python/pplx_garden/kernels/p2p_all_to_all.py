@@ -269,6 +269,11 @@ class P2PDispatchHandle:
             self.recv_done_event
         )
 
+    def debug_route_layout_plan(self) -> dict[str, Any]:
+        """Return the native route layout owned by this dispatch handle."""
+
+        return self.kernel.debug_low_latency_route_layout_plan_for_handle(self)
+
 
 @dataclass
 class P2PCombineHandle:
@@ -1351,6 +1356,19 @@ class P2PAllToAll(AllToAllKernel):
         if self._all_to_all is None:
             return {}
         return self._all_to_all.debug_low_latency_route_layout_plan(num_routed)
+
+    def debug_low_latency_route_layout_plan_for_handle(
+        self,
+        dispatch_handle: P2PDispatchHandle,
+    ) -> dict[str, Any]:
+        """Return native route metadata for a validated dispatch handle."""
+
+        if self._all_to_all is None:
+            return {}
+        return self._all_to_all.debug_low_latency_route_layout_plan_for_handle(
+            dispatch_handle._slot,
+            dispatch_handle._generation,
+        )
 
     @override
     def destroy(self) -> None:

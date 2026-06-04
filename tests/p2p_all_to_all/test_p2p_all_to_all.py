@@ -304,15 +304,7 @@ def _test_p2p_all_to_all_worker(
                 expert_padding=config.expert_padding,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
-            native_route_plan = all_to_all.debug_low_latency_route_layout_plan(
-                [
-                    [
-                        int(data.expected_num_tokens[expert].item())
-                        for expert in range(num_experts)
-                    ]
-                    for data in rank_data
-                ]
-            )
+            native_route_plan = ll_dispatch_handle.debug_route_layout_plan()
             expected_route_plan = expected_canonical_batched_experts_route_plan(
                 rank_data=rank_data,
                 first_expert=first_expert,
@@ -362,6 +354,9 @@ def _test_p2p_all_to_all_worker(
             ll_combine_recv()
             torch.cuda.synchronize()
             torch.testing.assert_close(ll_out_tokens, ref_out_tokens)
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                ll_dispatch_handle.debug_route_layout_plan()
 
             (
                 _ll_expert_x_reuse,

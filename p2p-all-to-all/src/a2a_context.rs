@@ -195,6 +195,7 @@ pub struct AllToAllContext {
     max_num_tokens: usize,
     max_recv_tokens: usize,
     max_tokens_per_expert: usize,
+    expert_padding: usize,
     num_experts_per_token: usize,
     max_private_tokens: usize,
     rank: usize,
@@ -408,6 +409,7 @@ impl AllToAllContext {
             max_num_tokens,
             max_recv_tokens,
             max_tokens_per_expert,
+            expert_padding,
             num_experts_per_token,
             max_private_tokens,
             rank,
@@ -510,6 +512,32 @@ impl AllToAllContext {
             (state, _) => Err(anyhow!(
                 "All-to-all stale or invalid handle for slot {slot}: \
                  expected {expected} generation {generation}, found {state:?}"
+            )),
+        }
+    }
+
+    fn validate_live_dispatch_handle(
+        &self,
+        slot: usize,
+        generation: u64,
+    ) -> Result<usize> {
+        let state = self.slot_state(slot)?.lock().unwrap();
+        match *state {
+            SlotGenerationState::DispatchSent {
+                generation: state_generation,
+                num_tokens,
+            }
+            | SlotGenerationState::DispatchReceived {
+                generation: state_generation,
+                num_tokens,
+            }
+            | SlotGenerationState::CombineSent {
+                generation: state_generation,
+                num_tokens,
+            } if state_generation == generation => Ok(num_tokens),
+            current => Err(anyhow!(
+                "All-to-all stale or invalid handle for slot {slot}: \
+                 expected live dispatch generation {generation}, found {current:?}"
             )),
         }
     }
@@ -1158,11 +1186,39 @@ impl AllToAllContext {
             self.node_size,
             self.world_size,
             self.num_experts,
-            1,
+            self.expert_padding,
             self.max_tokens_per_expert,
             self.max_private_tokens,
             1,
             |source_group, expert| num_routed[source_group][expert],
+        ))
+    }
+
+    pub fn debug_low_latency_route_layout_plan_for_handle(
+        &self,
+        slot: usize,
+        generation: u64,
+    ) -> Result<LowLatencyRouteLayoutPlan> {
+        self.validate_live_dispatch_handle(slot, generation)?;
+        let worker = self.worker(slot)?;
+        let num_ep_groups = self.world_size / self.dp_size;
+        let dp_group = self.rank / self.dp_size;
+        let dp_rank = self.rank % self.dp_size;
+        Ok(compute_low_latency_route_layout_plan(
+            dp_group,
+            dp_rank,
+            self.dp_size,
+            self.node_size,
+            self.world_size,
+            self.num_experts,
+            self.expert_padding,
+            self.max_tokens_per_expert,
+            self.max_private_tokens,
+            1,
+            |source_group, expert| {
+                debug_assert!(source_group < num_ep_groups);
+                worker.get_num_routed(source_group, expert)
+            },
         ))
     }
 }

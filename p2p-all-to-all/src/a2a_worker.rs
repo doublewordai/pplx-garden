@@ -879,7 +879,7 @@ impl WorkerState {
         self.slot.tx_ready.set(true);
     }
 
-    fn get_num_routed(&self, dp_group: usize, expert: usize) -> u32 {
+    pub(crate) fn get_num_routed(&self, dp_group: usize, expert: usize) -> u32 {
         assert!(dp_group < self.world_size / self.dp_size);
         assert!(expert < self.num_experts);
         unsafe {

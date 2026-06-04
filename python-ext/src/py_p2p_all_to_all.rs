@@ -3,7 +3,9 @@ use std::{
     ptr::{null, null_mut},
 };
 
-use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle};
+use p2p_all_to_all::{
+    AllToAllContext, AllToAllRankHandle, LowLatencyRouteLayoutPlan,
+};
 use pyo3::{
     Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods,
     types::PyDict, types::PyDictMethods, types::PyModule, types::PyModuleMethods,
@@ -13,6 +15,24 @@ use torch_lib::ScalarType;
 use crate::py_fabric_lib::{
     PyDomainAddress, PyMemoryRegionDescriptor, PyMemoryRegionHandle, PyTransferEngine,
 };
+
+fn low_latency_route_layout_plan_to_dict<'py>(
+    py: Python<'py>,
+    plan: LowLatencyRouteLayoutPlan,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("source_group_order", plan.source_group_order)?;
+    dict.set_item("source_rank", plan.source_rank)?;
+    dict.set_item("source_group", plan.source_group)?;
+    dict.set_item("final_index", plan.final_index)?;
+    dict.set_item(
+        "tokens_per_source_group_per_local_expert",
+        plan.tokens_per_source_group_per_local_expert,
+    )?;
+    dict.set_item("tokens_per_expert", plan.tokens_per_expert)?;
+    dict.set_item("num_recv_tokens", plan.num_recv_tokens)?;
+    Ok(dict)
+}
 
 #[pyclass(name = "AllToAllContext", module = "pplx_garden._rust")]
 pub(crate) struct PyAllToAllContext {
@@ -245,18 +265,20 @@ impl PyAllToAllContext {
             .ctx
             .debug_low_latency_route_layout_plan(num_routed)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let dict = PyDict::new(py);
-        dict.set_item("source_group_order", plan.source_group_order)?;
-        dict.set_item("source_rank", plan.source_rank)?;
-        dict.set_item("source_group", plan.source_group)?;
-        dict.set_item("final_index", plan.final_index)?;
-        dict.set_item(
-            "tokens_per_source_group_per_local_expert",
-            plan.tokens_per_source_group_per_local_expert,
-        )?;
-        dict.set_item("tokens_per_expert", plan.tokens_per_expert)?;
-        dict.set_item("num_recv_tokens", plan.num_recv_tokens)?;
-        Ok(dict)
+        low_latency_route_layout_plan_to_dict(py, plan)
+    }
+
+    fn debug_low_latency_route_layout_plan_for_handle<'py>(
+        &self,
+        py: Python<'py>,
+        slot: usize,
+        generation: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let plan = self
+            .ctx
+            .debug_low_latency_route_layout_plan_for_handle(slot, generation)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        low_latency_route_layout_plan_to_dict(py, plan)
     }
 
     #[allow(clippy::too_many_arguments)]
