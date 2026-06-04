@@ -22,6 +22,7 @@ from tests.markers import (
     mark_kernel,
 )
 from tests.p2p_all_to_all.data import RankTestData
+from tests.p2p_all_to_all.layout import assert_canonical_batched_experts_layout
 
 logger = logging_utils.get_logger(__name__)
 

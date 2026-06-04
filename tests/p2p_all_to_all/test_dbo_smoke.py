@@ -24,6 +24,7 @@ from tests.markers import (
     mark_kernel,
 )
 from tests.p2p_all_to_all.data import RankTestData
+from tests.p2p_all_to_all.layout import assert_canonical_batched_experts_layout
 
 logger = logging_utils.get_logger(__name__)
 
@@ -102,34 +103,44 @@ def _test_dbo_smoke_worker(
     if ll_max_tokens_per_expert is None:
         ll_max_tokens_per_expert = max_num_tokens * global_group.size
 
-    # Create dummy data for Batch A and Batch B with distinct seeds
-    generator_a = torch.Generator(device=device)
-    generator_a.manual_seed(global_group.rank)
-    data_a = RankTestData.create(
-        num_experts=num_experts,
-        num_experts_per_token=num_experts_per_token,
-        max_num_tokens=max_num_tokens,
-        hidden_dim=hidden_dim,
-        hidden_dim_scale=hidden_dim_scale,
-        in_dtype=in_dtype,
-        scale_dtype=scale_dtype,
-        generator=generator_a,
-        device=device,
-    )
+    # Create dummy data for Batch A and Batch B with distinct seeds.
+    rank_data_a = []
+    rank_data_b = []
+    for rank in range(num_dp_groups):
+        generator_a = torch.Generator(device=device)
+        generator_a.manual_seed(rank)
+        rank_data_a.append(
+            RankTestData.create(
+                num_experts=num_experts,
+                num_experts_per_token=num_experts_per_token,
+                max_num_tokens=max_num_tokens,
+                hidden_dim=hidden_dim,
+                hidden_dim_scale=hidden_dim_scale,
+                in_dtype=in_dtype,
+                scale_dtype=scale_dtype,
+                generator=generator_a,
+                device=device,
+            )
+        )
 
-    generator_b = torch.Generator(device=device)
-    generator_b.manual_seed(global_group.rank + 100)
-    data_b = RankTestData.create(
-        num_experts=num_experts,
-        num_experts_per_token=num_experts_per_token,
-        max_num_tokens=max_num_tokens,
-        hidden_dim=hidden_dim,
-        hidden_dim_scale=hidden_dim_scale,
-        in_dtype=in_dtype,
-        scale_dtype=scale_dtype,
-        generator=generator_b,
-        device=device,
-    )
+        generator_b = torch.Generator(device=device)
+        generator_b.manual_seed(rank + 100)
+        rank_data_b.append(
+            RankTestData.create(
+                num_experts=num_experts,
+                num_experts_per_token=num_experts_per_token,
+                max_num_tokens=max_num_tokens,
+                hidden_dim=hidden_dim,
+                hidden_dim_scale=hidden_dim_scale,
+                in_dtype=in_dtype,
+                scale_dtype=scale_dtype,
+                generator=generator_b,
+                device=device,
+            )
+        )
+
+    data_a = rank_data_a[dp_rank]
+    data_b = rank_data_b[dp_rank]
 
     node_group: Optional[ParallelGroup]
     if config.nvlink_group is not None:
