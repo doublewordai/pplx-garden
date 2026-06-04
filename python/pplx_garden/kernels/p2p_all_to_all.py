@@ -65,7 +65,10 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
 
 @dataclass
 class _LowLatencyWorkspaceEntry:
+    alloc: CUMemAllocHandle
+    mapping: CUMemMapping
     storage: torch.Tensor
+    capacity_bytes: int
     in_use: bool = False
 
 
@@ -134,7 +137,7 @@ class _LowLatencyWorkspacePool:
         total_bytes = int(layout["total_bytes"])
 
         entry = self._entries.get(key)
-        current_bytes = 0 if entry is None else entry.storage.numel()
+        current_bytes = 0 if entry is None else entry.capacity_bytes
         if entry is not None and entry.in_use:
             raise RuntimeError(
                 "PPLX low-latency workspace is already in use for "
@@ -148,14 +151,25 @@ class _LowLatencyWorkspacePool:
                     f"capture: slot={key} required={total_bytes} "
                     f"current={current_bytes}"
                 )
-            storage = torch.empty((total_bytes,), dtype=torch.uint8, device=device)
-            entry = _LowLatencyWorkspaceEntry(storage=storage)
+            capacity_bytes = round_up(total_bytes, _PAGE_SIZE)
+            alloc = CUMemAllocHandle(
+                capacity_bytes, device, CUMemHandleKind.Local
+            )
+            mapping = alloc.map(device)
+            storage = mapping.to_tensor((capacity_bytes,), torch.uint8)
+            entry = _LowLatencyWorkspaceEntry(
+                alloc=alloc,
+                mapping=mapping,
+                storage=storage,
+                capacity_bytes=capacity_bytes,
+            )
             self._entries[key] = entry
             logger.info(
                 "PPLX low-latency workspace allocate: slot=%s bytes=%.2f GiB "
-                "expert_x=%s %s",
+                "capacity=%.2f GiB backing=cumem expert_x=%s %s",
                 key,
                 total_bytes / 1024**3,
+                capacity_bytes / 1024**3,
                 offsets["expert_x"][2],
                 activation_dtype,
             )
