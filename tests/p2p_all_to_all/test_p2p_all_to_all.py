@@ -26,6 +26,8 @@ from tests.p2p_all_to_all.layout import (
     assert_batched_experts_layout_semantics,
     assert_canonical_batched_experts_layout,
     expected_canonical_batched_experts_route_plan,
+    expected_combine_from_route_metadata,
+    expected_local_expert_source_contribution,
 )
 
 logger = logging_utils.get_logger(__name__)
@@ -462,6 +464,27 @@ def _test_p2p_all_to_all_worker(
                 config.max_tokens_per_expert,
                 hidden_dim,
             )
+            metadata_ref_out_tokens = expected_combine_from_route_metadata(
+                expert_y=ll_expert_y,
+                route_plan=native_route_plan,
+                rank_data=rank_data,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                out_dtype=out_dtype,
+            )
+            local_expert_ref_out_tokens = (
+                expected_local_expert_source_contribution(
+                    source=local_rank,
+                    activated_source_x=ref_out_tokens,
+                    first_expert=first_expert,
+                    num_local_experts=num_local_experts,
+                    out_dtype=out_dtype,
+                )
+            )
+            torch.testing.assert_close(
+                metadata_ref_out_tokens,
+                local_expert_ref_out_tokens,
+            )
             ll_out_tokens = torch.empty_like(out_tokens)
             _ll_combine_handle, ll_combine_recv = all_to_all.low_latency_combine(
                 ll_expert_y,
@@ -488,6 +511,20 @@ def _test_p2p_all_to_all_worker(
                 num_local_experts,
                 config.max_tokens_per_expert,
                 hidden_dim,
+            )
+            metadata_ref_out_tokens_interleaved = (
+                expected_combine_from_route_metadata(
+                    expert_y=ll_expert_y_interleaved,
+                    route_plan=ll_dispatch_handle_interleaved.debug_route_layout_plan(),
+                    rank_data=rank_data,
+                    rank=global_group.rank,
+                    dp_size=tp_group.size,
+                    out_dtype=out_dtype,
+                )
+            )
+            torch.testing.assert_close(
+                metadata_ref_out_tokens_interleaved,
+                local_expert_ref_out_tokens,
             )
             ll_out_tokens_interleaved = torch.empty_like(out_tokens)
             _ll_combine_handle_interleaved, ll_combine_recv_interleaved = (

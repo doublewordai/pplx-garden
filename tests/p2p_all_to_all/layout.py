@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
@@ -325,3 +325,79 @@ def assert_batched_experts_layout_semantics(
             assert sorted(map(_row_key, actual_scales)) == sorted(
                 map(_row_key, scales)
             )
+
+
+def expected_combine_from_route_metadata(
+    *,
+    expert_y: torch.Tensor,
+    route_plan: dict[str, list[int] | list[list[int]] | int],
+    rank_data: list[RankTestData],
+    rank: int,
+    dp_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Invert BatchedExperts output using only dispatch-handle route metadata.
+
+    This is the contract a NIXL-shaped combine path needs: expert output is
+    addressed by final BatchedExperts slot, and each slot carries enough source
+    identity to route the weighted result back to its original token/top-k slot.
+    """
+
+    source_group = rank // dp_size
+    source = rank_data[source_group]
+    result = torch.zeros(
+        (source.dp_x.shape[0], expert_y.shape[-1]),
+        device=expert_y.device,
+        dtype=torch.float32,
+    )
+    flat_expert_y = expert_y.reshape(-1, expert_y.shape[-1]).to(torch.float32)
+
+    final_indices = cast(list[int], route_plan["final_index"])
+    source_ranks = cast(list[int], route_plan["source_rank_by_final_index"])
+    source_tokens = cast(list[int], route_plan["source_token_index"])
+    source_routes = cast(list[int], route_plan["source_route_index"])
+
+    assert len(final_indices) == len(source_ranks)
+    assert len(final_indices) == len(source_tokens)
+    assert len(final_indices) == len(source_routes)
+
+    for final_index, source_rank, token_index, route_index in zip(
+        final_indices,
+        source_ranks,
+        source_tokens,
+        source_routes,
+    ):
+        if source_rank != rank:
+            continue
+
+        weight = source.weights[token_index, route_index].to(torch.float32)
+        result[token_index] += flat_expert_y[final_index] * weight
+
+    return result.to(out_dtype)
+
+
+def expected_local_expert_source_contribution(
+    *,
+    source: RankTestData,
+    activated_source_x: torch.Tensor,
+    first_expert: int,
+    num_local_experts: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the source-token contribution produced by one rank's experts."""
+
+    result = torch.zeros(
+        activated_source_x.shape,
+        device=activated_source_x.device,
+        dtype=torch.float32,
+    )
+    activated_source_x_f32 = activated_source_x.to(torch.float32)
+    for token_index in range(source.indices.shape[0]):
+        for route_index in range(source.indices.shape[1]):
+            expert = int(source.indices[token_index, route_index].item())
+            if not first_expert <= expert < first_expert + num_local_experts:
+                continue
+            weight = source.weights[token_index, route_index].to(torch.float32)
+            result[token_index] += activated_source_x_f32[token_index] * weight
+
+    return result.to(out_dtype)
