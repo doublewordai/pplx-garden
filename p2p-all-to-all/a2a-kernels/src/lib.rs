@@ -134,8 +134,6 @@ mod ffi {
             out_tokens_stride: usize,
             accumulate: bool,
             recv_buffer: *mut u8,
-            token_offset: *mut u32,
-            expert_offsets: *mut u32,
             combine_recv_position: *mut u32,
             combine_recv_flag: *mut u8,
             combine_recv_done: *mut u32,

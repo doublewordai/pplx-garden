@@ -1004,13 +1004,11 @@ impl AllToAllContext {
                 indices_ptr,
             );
             eprintln!(
-                "PPLX combine_recv ptrs rank={} slot={} epoch={} recv_buffer={:?} token_offset={:?} expert_offsets={:?} padded_index={:?} combine_send_offset={:?} source_rank={:?} max_recv_tokens={}",
+                "PPLX combine_recv ptrs rank={} slot={} epoch={} recv_buffer={:?} padded_index={:?} combine_send_offset={:?} source_rank={:?} max_recv_tokens={}",
                 rank,
                 slot,
                 epoch,
                 worker.buffers.recv_buffer_ptr,
-                workspace.token_offset.get_mut_ptr::<u32>(),
-                workspace.expert_offsets.get_mut_ptr::<u32>(),
                 worker.slot.padded_index.get_device_ptr(),
                 worker.slot.combine_send_offset.get_device_ptr(),
                 worker.slot.source_rank.get_device_ptr(),
@@ -1041,8 +1039,6 @@ impl AllToAllContext {
             out_tokens_stride,
             accumulate,
             worker.buffers.recv_buffer_ptr as *mut u8,
-            workspace.token_offset.get_mut_ptr(),
-            workspace.expert_offsets.get_mut_ptr(),
             workspace.combine_recv_position.get_mut_ptr(),
             worker.slot.combine_recv_flag.get_device_ptr(),
             worker.slot.combine_recv_done.get_device_ptr(),

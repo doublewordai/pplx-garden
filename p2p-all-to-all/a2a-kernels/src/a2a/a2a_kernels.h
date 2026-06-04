@@ -140,8 +140,6 @@ int a2a_combine_recv(
     size_t out_tokens_stride,
     bool accumulate,
     uint8_t *recv_buffer,
-    uint32_t *token_offset,
-    uint32_t *expert_offsets,
     uint32_t *combine_recv_position,
     uint8_t *combine_recv_flag,
     uint32_t *combine_recv_done,
