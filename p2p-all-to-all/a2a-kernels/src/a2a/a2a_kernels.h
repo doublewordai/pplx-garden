@@ -41,6 +41,7 @@ int a2a_dispatch_send(
     size_t num_experts,
     size_t num_experts_per_token,
     size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t node_size,

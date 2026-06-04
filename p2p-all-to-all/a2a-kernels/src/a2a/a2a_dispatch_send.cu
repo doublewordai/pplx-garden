@@ -15,6 +15,7 @@ using namespace rose::device;
 
 struct ExpertAndOffset {
     uint32_t expert;
+    uint32_t expert_offset;
     uint32_t offset;
     uint32_t position;
     float weight;
@@ -54,7 +55,7 @@ public:
         const uint32_t position = (expert > 0 ? expert_offsets_[expert - 1] : 0) + offset;
         const uint32_t dst_expert_rank = expert / experts_per_rank;
         const uint32_t rank_offset = dst_expert_rank > 0 ? expert_offsets_[dst_expert_rank * experts_per_rank - 1] : 0;
-        return {expert, position - rank_offset, position, weight};
+        return {expert, offset, position - rank_offset, position, weight};
     }
 
 private:
@@ -93,18 +94,20 @@ public:
             const uint32_t rank_offset = dst_expert_rank > 0 ? expert_offsets[dst_expert_rank * experts_per_rank - 1] : 0;
             experts_[i] = expert;
             weights_[i] = weight;
+            expert_offsets_[i] = offset;
             offsets_[i] = position - rank_offset;
             positions_[i] = position;
         }
     }
 
     __forceinline__ __device__ ExpertAndOffset operator[](unsigned i) {
-        return {experts_[i], offsets_[i], positions_[i], weights_[i]};
+        return {experts_[i], expert_offsets_[i], offsets_[i], positions_[i], weights_[i]};
     }
 
 private:
     uint32_t experts_[N];
     float weights_[N];
+    uint32_t expert_offsets_[N];
     uint32_t offsets_[N];
     uint32_t positions_[N];
 };
@@ -119,6 +122,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     size_t num_experts,
     size_t num_experts_per_token,
     size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t node_size,
@@ -192,6 +196,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
         if (threadIdx.x == 0) {
             combine_recv_position[token * num_experts_per_token_bound + route] = position;
         }
+    };
+    auto private_recv_offset = [&](const ExpertAndOffset& route) {
+        const uint32_t dst_expert_group = route.expert / experts_per_rank;
+        const uint32_t local_expert = route.expert - dst_expert_group * experts_per_rank;
+        if (num_max_dispatch_tokens_per_rank > 0
+                && experts_per_rank * num_max_dispatch_tokens_per_rank <= max_private_tokens) {
+            const uint32_t rect_offset = node_group * max_private_tokens
+                + local_expert * num_max_dispatch_tokens_per_rank
+                + route.expert_offset;
+            return rect_offset;
+        }
+        return static_cast<uint32_t>(node_group * max_private_tokens + route.offset);
+    };
+    auto can_use_private_recv = [&](const ExpertAndOffset& route) {
+        return private_recv_offset(route) < (node_group + 1) * max_private_tokens;
     };
 
     // In the first phase, count how many tokens are sent to each other rank
@@ -329,11 +348,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
-                        if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                        if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
-                                std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                                std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 store_source_route_info(token_ptr, token, e);
                                 st_global_nc_uint4(&x_token_dst[i], val);
@@ -378,7 +397,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node != node_rank || dst_rank == rank || route.offset >= max_private_tokens) {
+                    if (dst_node != node_rank || dst_rank == rank || !can_use_private_recv(route)) {
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
@@ -405,10 +424,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                    if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
                         // Write to the private recv buffer directly using NVLink.
                         const uint32_t local_peer = dst_rank % NODE_SIZE;
-                        std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                        std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
                         store_source_route_info(token_ptr, token, e);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
@@ -465,7 +484,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                    if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
                         continue;
                     } else {
                         // Always write into the send buffer for local copies.
@@ -518,11 +537,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
-                        if (dst_node == node_rank && dst_rank != rank && route.offset < max_private_tokens) {
+                        if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
-                                std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
+                                std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 store_source_route_info(token_ptr, token, e);
                                 st_global_nc_uint4(&x_token_dst[i], val);
@@ -563,6 +582,7 @@ int a2a_kernels::a2a_dispatch_send(
     size_t num_experts,
     size_t num_experts_per_token,
     size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t node_size,
@@ -620,6 +640,7 @@ int a2a_kernels::a2a_dispatch_send(
         &num_experts,
         &num_experts_per_token,
         &max_private_tokens,
+        &num_max_dispatch_tokens_per_rank,
         &rank,
         &dp_size,
         &node_size,

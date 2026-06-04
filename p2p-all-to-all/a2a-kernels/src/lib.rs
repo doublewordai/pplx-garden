@@ -35,6 +35,7 @@ mod ffi {
             num_experts: usize,
             num_experts_per_token: usize,
             max_private_tokens: usize,
+            num_max_dispatch_tokens_per_rank: usize,
             rank: usize,
             dp_size: usize,
             node_size: usize,

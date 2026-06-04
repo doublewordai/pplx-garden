@@ -881,6 +881,11 @@ impl AllToAllContext {
         let num_experts = self.num_experts;
         let num_experts_per_token = self.num_experts_per_token;
         let max_private_tokens = self.max_private_tokens;
+        let num_max_dispatch_tokens_per_rank = if self.max_tokens_per_expert > 0 {
+            self.max_tokens_per_expert / (self.world_size / self.dp_size)
+        } else {
+            0
+        };
         let rank = self.rank;
         let dp_size = self.dp_size;
         let node_size = self.node_size;
@@ -906,6 +911,7 @@ impl AllToAllContext {
             num_experts,
             num_experts_per_token,
             max_private_tokens,
+            num_max_dispatch_tokens_per_rank,
             rank,
             dp_size,
             node_size,

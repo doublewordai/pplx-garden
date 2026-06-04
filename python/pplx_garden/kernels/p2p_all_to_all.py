@@ -461,6 +461,11 @@ class P2PAllToAll(AllToAllKernel):
         if max_private_tokens is None:
             max_private_tokens = avg_tokens_per_expert * self._num_local_experts
         assert max_private_tokens >= 0
+        if self._num_max_dispatch_tokens_per_rank is not None:
+            rect_private_tokens = (
+                self._num_local_experts * self._num_max_dispatch_tokens_per_rank
+            )
+            max_private_tokens = max(max_private_tokens, rect_private_tokens)
 
         num_tokens = max_num_tokens * num_dp_groups
         max_recv_tokens = max_private_tokens * num_dp_groups + round_up(

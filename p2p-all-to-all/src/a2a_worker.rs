@@ -154,10 +154,17 @@ fn compute_receive_route_plan(
     mut get_num_routed: impl FnMut(usize, usize) -> u32,
 ) -> ReceiveRoutePlan {
     let num_dp_groups = world_size / dp_size;
+    let num_max_dispatch_tokens_per_rank = if max_tokens_per_expert > 0 {
+        max_tokens_per_expert / num_dp_groups
+    } else {
+        0
+    };
     let experts_per_rank = num_experts.div_ceil(num_dp_groups);
     let first_local_expert = dp_group * experts_per_rank;
     let last_local_expert = (first_local_expert + experts_per_rank).min(num_experts);
     let num_local_experts = last_local_expert - first_local_expert;
+    let use_rect_private_offsets = num_max_dispatch_tokens_per_rank > 0
+        && num_local_experts * num_max_dispatch_tokens_per_rank <= max_private_tokens;
     let rank = dp_group * dp_size + dp_rank;
     let rank_node = rank / node_size;
     let groups_per_node = node_size / dp_size;
@@ -244,7 +251,7 @@ fn compute_receive_route_plan(
             let src_offset = src_group_offset[peer_group];
             let dst_offset = dst_group_offset[peer_group];
             let peer_rank = peer_group * dp_size + dp_rank;
-            for _ in 0..routed {
+            for token_offset_in_expert in 0..routed {
                 if peer_rank == rank {
                     let local_offset = source_expert_offset[expert];
                     source_expert_offset[expert] += 1;
@@ -253,8 +260,18 @@ fn compute_receive_route_plan(
                 } else {
                     let index_on_rank = src_dispatch_count[peer_group];
                     src_dispatch_count[peer_group] += 1;
+                    let rect_private_offset = private_offset
+                        + (local_expert * num_max_dispatch_tokens_per_rank) as u32
+                        + token_offset_in_expert;
+                    let use_rect_private_offset = num_max_dispatch_tokens_per_rank > 0
+                        && use_rect_private_offsets
+                        && peer_rank / node_size == rank_node
+                        && (rect_private_offset as usize)
+                            < (peer_group + 1) * max_private_tokens;
 
-                    if (index_on_rank as usize) < max_private_tokens {
+                    if use_rect_private_offset {
+                        source_dispatch_offset[last] = rect_private_offset;
+                    } else if (index_on_rank as usize) < max_private_tokens {
                         source_dispatch_offset[last] = private_offset + index_on_rank;
                     } else if peer_rank / node_size == rank_node {
                         source_dispatch_offset[last] =
