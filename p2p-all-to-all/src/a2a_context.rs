@@ -955,6 +955,53 @@ impl AllToAllContext {
         Ok(())
     }
 
+    #[allow(dead_code, clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+    fn dispatch_route_on_reserved_slot(
+        &mut self,
+        slot: usize,
+        num_tokens: usize,
+        bound_m_ptr: *const i32,
+        indices: *const i32,
+        indices_stride: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let num_experts = self.num_experts;
+        let num_experts_per_token = self.num_experts_per_token;
+        let rank = self.rank;
+        let dp_size = self.dp_size;
+        let world_size = self.world_size;
+        let worker = self.worker(slot)?.clone();
+        let workspace = self.workspace_mut(slot)?;
+
+        cuda_check!(a2a_kernels::a2a_dispatch_route(
+            num_experts,
+            num_experts_per_token,
+            rank,
+            dp_size,
+            world_size,
+            num_tokens,
+            bound_m_ptr,
+            indices,
+            indices_stride,
+            workspace.token_offset.get_mut_ptr(),
+            worker.buffers.num_routed_ptr,
+            workspace.expert_offsets.get_mut_ptr(),
+            workspace.combine_recv_position.get_mut_ptr(),
+            worker.slot.dispatch_route_done.get_device_ptr(),
+            workspace.epoch_counter.get_mut_ptr(),
+            workspace.current_epoch.get_mut_ptr(),
+            stream,
+        ))
+        .map_err(|e| anyhow!("a2a_dispatch_route slot {slot}: {e}"))?;
+
+        if worker.failed() {
+            return Err(anyhow!(
+                "a2a_dispatch_route slot {slot}: fabric-lib transfer error"
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn dispatch_recv(
         &mut self,

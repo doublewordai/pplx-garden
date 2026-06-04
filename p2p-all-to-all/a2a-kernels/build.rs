@@ -23,6 +23,7 @@ fn main() {
     }
 
     build
+        .file("src/a2a/a2a_dispatch_route.cu")
         .file("src/a2a/a2a_dispatch_recv.cu")
         .file("src/a2a/a2a_combine_send.cu")
         .file("src/a2a/a2a_combine_recv.cu")

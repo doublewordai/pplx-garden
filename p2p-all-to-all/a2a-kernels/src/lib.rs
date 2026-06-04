@@ -8,6 +8,26 @@ mod ffi {
         #[namespace = "torch_lib"]
         type ScalarType = torch_lib::ScalarType;
 
+        unsafe fn a2a_dispatch_route(
+            num_experts: usize,
+            num_experts_per_token: usize,
+            rank: usize,
+            dp_size: usize,
+            world_size: usize,
+            num_tokens: usize,
+            bound_m_ptr: *const i32,
+            indices: *const i32,
+            indices_stride: usize,
+            token_offset: *mut u32,
+            num_routed: *mut u32,
+            expert_offsets: *mut u32,
+            combine_recv_position: *mut u32,
+            dispatch_route_done: *mut u32,
+            epoch_counter: *mut u32,
+            current_epoch: *mut u32,
+            stream: u64,
+        ) -> i32;
+
         unsafe fn a2a_dispatch_send(
             num_blocks: usize,
             hidden_dim: usize,
@@ -146,5 +166,6 @@ mod ffi {
 }
 
 pub use ffi::{
-    a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv, a2a_dispatch_send,
+    a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv, a2a_dispatch_route,
+    a2a_dispatch_send,
 };

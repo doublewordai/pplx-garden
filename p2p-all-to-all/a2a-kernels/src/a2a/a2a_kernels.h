@@ -14,6 +14,26 @@ using ScalarType = torch_lib::ScalarType;
 
 namespace a2a_kernels {
 
+int a2a_dispatch_route(
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t rank,
+    size_t dp_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t *bound_m_ptr,
+    const int32_t *indices,
+    size_t indices_stride,
+    uint32_t *token_offset,
+    uint32_t *num_routed,
+    uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
+    uint32_t *dispatch_route_done,
+    uint32_t *epoch_counter,
+    uint32_t *current_epoch,
+    uint64_t stream
+);
+
 int a2a_dispatch_send(
     size_t num_blocks,
     size_t hidden_dim,
