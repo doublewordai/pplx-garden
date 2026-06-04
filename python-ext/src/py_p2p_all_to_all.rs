@@ -3,9 +3,7 @@ use std::{
     ptr::{null, null_mut},
 };
 
-use p2p_all_to_all::{
-    AllToAllContext, AllToAllRankHandle, LowLatencyRouteLayoutPlan,
-};
+use p2p_all_to_all::{AllToAllContext, AllToAllRankHandle, LowLatencyRouteLayoutPlan};
 use pyo3::{
     Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods,
     types::PyDict, types::PyDictMethods, types::PyModule, types::PyModuleMethods,
@@ -70,6 +68,8 @@ impl PyAllToAllContext {
         sync_ptrs: Vec<Vec<u64>>,
         send_ptrs: Vec<Vec<u64>>,
         recv_ptrs: Vec<Vec<u64>>,
+        node_route_count_ptrs: Vec<Vec<u64>>,
+        node_route_epoch_ptrs: Vec<Vec<u64>>,
         device: u8,
         imm_base: u32,
         ranks: Vec<(
@@ -130,19 +130,15 @@ impl PyAllToAllContext {
             world_size,
             num_routed_ptrs.into_iter().map(|ptr| ptr as *mut u32).collect(),
             num_routed_mrs.into_iter().map(|mr| mr.0).collect(),
-            send_buffer_ptrs
-                .into_iter()
-                .map(|ptr| ptr as *mut c_void)
-                .collect(),
+            send_buffer_ptrs.into_iter().map(|ptr| ptr as *mut c_void).collect(),
             send_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
-            recv_buffer_ptrs
-                .into_iter()
-                .map(|ptr| ptr as *mut c_void)
-                .collect(),
+            recv_buffer_ptrs.into_iter().map(|ptr| ptr as *mut c_void).collect(),
             recv_buffer_mrs.into_iter().map(|mr| mr.0).collect(),
             sync_ptrs,
             send_ptrs,
             recv_ptrs,
+            node_route_count_ptrs,
+            node_route_epoch_ptrs,
             device,
             imm_base,
             rank_handles,
@@ -382,10 +378,7 @@ impl PyAllToAllContext {
         dict.set_item("route_exchange_ns", stats.route_exchange_ns)?;
         dict.set_item("process_routing_ns", stats.process_routing_ns)?;
         dict.set_item("wait_dispatch_send_ns", stats.wait_dispatch_send_ns)?;
-        dict.set_item(
-            "dispatch_transfer_wait_ns",
-            stats.dispatch_transfer_wait_ns,
-        )?;
+        dict.set_item("dispatch_transfer_wait_ns", stats.dispatch_transfer_wait_ns)?;
         dict.set_item("wait_dispatch_recv_ns", stats.wait_dispatch_recv_ns)?;
         dict.set_item("dispatch_barrier_ns", stats.dispatch_barrier_ns)?;
         dict.set_item("wait_combine_send_ns", stats.wait_combine_send_ns)?;

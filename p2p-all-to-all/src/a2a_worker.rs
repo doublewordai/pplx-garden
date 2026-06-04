@@ -680,6 +680,8 @@ pub(crate) struct WorkerState {
     route_write_op: TransferRequest,
     dispatch_barrier_write_op: TransferRequest,
     combine_barrier_write_op: TransferRequest,
+    node_route_count_ptrs: Vec<usize>,
+    node_route_epoch_ptrs: Vec<usize>,
     pub(crate) accumulated_local_dispatch_bytes: AtomicU64,
     pub(crate) accumulated_nvlink_dispatch_bytes: AtomicU64,
     pub(crate) accumulated_network_dispatch_bytes: AtomicU64,
@@ -735,6 +737,8 @@ impl WorkerState {
         send_buffer_mr: MemoryRegionHandle,
         recv_buffer_ptr: *mut c_void,
         recv_buffer_mr: MemoryRegionHandle,
+        node_route_count_ptrs: Vec<usize>,
+        node_route_epoch_ptrs: Vec<usize>,
         device: u8,
         imm_base: u32,
         rank_handles: Vec<AllToAllRankHandle>,
@@ -869,6 +873,8 @@ impl WorkerState {
             route_write_op,
             dispatch_barrier_write_op,
             combine_barrier_write_op,
+            node_route_count_ptrs,
+            node_route_epoch_ptrs,
             accumulated_local_dispatch_bytes: AtomicU64::new(0),
             accumulated_nvlink_dispatch_bytes: AtomicU64::new(0),
             accumulated_network_dispatch_bytes: AtomicU64::new(0),
@@ -910,6 +916,58 @@ impl WorkerState {
             )
         }
         .load(Ordering::Relaxed)
+    }
+
+    fn has_node_route_exchange(&self) -> bool {
+        self.world_size == self.node_size
+            && self.node_route_count_ptrs.len() == self.world_size
+            && self.node_route_epoch_ptrs.len() == self.world_size
+    }
+
+    fn publish_local_node_route_counts(&self, epoch: u32) {
+        debug_assert!(self.has_node_route_exchange());
+        let local_counts = unsafe {
+            self.buffers.num_routed_ptr.add(self.dp_group * self.num_experts)
+        };
+        let local_route_counts = self.node_route_count_ptrs[self.rank] as *mut u32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                local_counts,
+                local_route_counts,
+                self.num_experts,
+            );
+            AtomicU32::from_ptr(self.node_route_epoch_ptrs[self.rank] as *mut u32)
+                .store(epoch, Ordering::Release);
+        }
+    }
+
+    fn wait_node_route_counts(&self, epoch: u32) -> bool {
+        debug_assert!(self.has_node_route_exchange());
+        let num_dp_groups = self.world_size / self.dp_size;
+        for peer_group in 0..num_dp_groups {
+            let peer_rank = peer_group * self.dp_size + self.dp_rank;
+            let peer_epoch =
+                unsafe { AtomicU32::from_ptr(self.node_route_epoch_ptrs[peer_rank] as *mut u32) };
+            while peer_epoch.load(Ordering::Acquire) != epoch {
+                if !self.is_running() {
+                    return false;
+                }
+                std::hint::spin_loop();
+            }
+
+            let peer_route_counts = self.node_route_count_ptrs[peer_rank] as *mut u32;
+            let local_row = unsafe {
+                self.buffers.num_routed_ptr.add(peer_group * self.num_experts)
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    peer_route_counts,
+                    local_row,
+                    self.num_experts,
+                );
+            }
+        }
+        true
     }
 
     fn get_dispatch_token_dim(&self) -> usize {
@@ -1002,14 +1060,19 @@ impl WorkerState {
             return;
         }
 
-        // Start exchanging routing info.
-        self.transfer_engine
-            .submit_transfer_atomic(
-                self.route_write_op.clone(),
-                self.tx_counter.clone(),
-                self.err_counter.clone(),
-            )
-            .unwrap();
+        let use_node_route_exchange = self.has_node_route_exchange();
+        if use_node_route_exchange {
+            self.publish_local_node_route_counts(epoch);
+        } else {
+            // Start exchanging routing info.
+            self.transfer_engine
+                .submit_transfer_atomic(
+                    self.route_write_op.clone(),
+                    self.tx_counter.clone(),
+                    self.err_counter.clone(),
+                )
+                .unwrap();
+        }
 
         // Wait for the dispatch kernel to copy tokens into send buffers.
         let wait_dispatch_send_start = Instant::now();
@@ -1029,9 +1092,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch_send_done observed; tx_ready cleared",
-                self.rank,
-                self.slot_idx,
-                epoch
+                self.rank, self.slot_idx, epoch
             );
         }
         if !self.is_running() {
@@ -1043,10 +1104,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch_initial_routes num_private_ranges={}",
-                self.rank,
-                self.slot_idx,
-                epoch,
-                num_private_ranges
+                self.rank, self.slot_idx, epoch, num_private_ranges
             );
         }
 
@@ -1065,8 +1123,14 @@ impl WorkerState {
             );
         }
         let route_exchange_start = Instant::now();
-        if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
-            return;
+        if use_node_route_exchange {
+            if !self.wait_node_route_counts(epoch) {
+                return;
+            }
+        } else {
+            if !self.wait_imm(&self.route_counter, num_dp_groups - 1) {
+                return;
+            }
         }
         Self::add_elapsed_ns(&self.accumulated_route_exchange_ns, route_exchange_start);
         let process_routing_start = Instant::now();
@@ -1121,10 +1185,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting dispatch counter target={}",
-                    self.rank,
-                    self.slot_idx,
-                    epoch,
-                    route.num_recv_tx
+                    self.rank, self.slot_idx, epoch, route.num_recv_tx
                 );
             }
             let dispatch_transfer_wait_start = Instant::now();
@@ -1136,9 +1197,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch counter observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -1147,16 +1206,11 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting dispatch_recv_done",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
             let wait_dispatch_recv_start = Instant::now();
-            if !self.wait_epoch(
-                &self.slot.dispatch_recv_done,
-                epoch,
-            ) {
+            if !self.wait_epoch(&self.slot.dispatch_recv_done, epoch) {
                 return;
             }
             Self::add_elapsed_ns(
@@ -1166,9 +1220,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} dispatch_recv_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -1197,10 +1249,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch barrier complete num_dispatch_tx={}",
-                self.rank,
-                self.slot_idx,
-                epoch,
-                num_dispatch_tx
+                self.rank, self.slot_idx, epoch, num_dispatch_tx
             );
         }
 
@@ -1230,9 +1279,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine_send_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -1259,10 +1306,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting combine imm target={}",
-                    self.rank,
-                    self.slot_idx,
-                    epoch,
-                    num_combine_imm
+                    self.rank, self.slot_idx, epoch, num_combine_imm
                 );
             }
             let combine_transfer_wait_start = Instant::now();
@@ -1277,9 +1321,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine imm observed; recv flag set",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -1287,9 +1329,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} waiting combine_recv_done",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
             let wait_combine_recv_start = Instant::now();
@@ -1303,9 +1343,7 @@ impl WorkerState {
             if trace {
                 eprintln!(
                     "PPLX worker rank={} slot={} epoch={} combine_recv_done observed",
-                    self.rank,
-                    self.slot_idx,
-                    epoch
+                    self.rank, self.slot_idx, epoch
                 );
             }
 
@@ -1332,9 +1370,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} combine barrier complete; releasing slot",
-                self.rank,
-                self.slot_idx,
-                epoch
+                self.rank, self.slot_idx, epoch
             );
         }
         self.epoch.fetch_add(1, Ordering::Release);
@@ -1413,9 +1449,11 @@ impl WorkerState {
         self.slot.source_rank.copy(&plan.source_rank);
         self.slot.source_dispatch_offset.copy(&plan.source_dispatch_offset);
         self.slot.combine_send_offset.copy(&plan.combine_send_offset);
-        self.slot
-            .num_recv_tokens
-            .copy(&[plan.num_recv_tokens as u32, plan.num_recv_efa_tokens as u32, 0]);
+        self.slot.num_recv_tokens.copy(&[
+            plan.num_recv_tokens as u32,
+            plan.num_recv_efa_tokens as u32,
+            0,
+        ]);
         self.slot.num_recv_tokens_ready.set(epoch);
 
         // Prepare the dispatch commands, beyond the private recv buffers.
@@ -1520,10 +1558,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} submitting num_tx={}",
-                self.rank,
-                self.slot_idx,
-                label,
-                num_tx
+                self.rank, self.slot_idx, label, num_tx
             );
         }
 
@@ -1552,9 +1587,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} imm observed",
-                self.rank,
-                self.slot_idx,
-                label
+                self.rank, self.slot_idx, label
             );
         }
 
@@ -1564,11 +1597,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} waiting tx_counter old={} subtract={}",
-                self.rank,
-                self.slot_idx,
-                label,
-                old,
-                num_tx_total
+                self.rank, self.slot_idx, label, old, num_tx_total
             );
         }
         if old < num_tx_total {
@@ -1584,9 +1613,7 @@ impl WorkerState {
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} barrier={} tx_ready set",
-                self.rank,
-                self.slot_idx,
-                label
+                self.rank, self.slot_idx, label
             );
         }
 

@@ -1,8 +1,10 @@
 import os
 import pickle
+import ctypes
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 from typing import Any, Optional
 
 import torch
@@ -57,6 +59,12 @@ class _NVLRankMapping:
     sync_mapping: CUMemMapping
     send_mapping: CUMemMapping
     recv_mapping: CUMemMapping
+
+
+@dataclass
+class _NodeRouteShmData:
+    names: list[str]
+    sizes: list[int]
 
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
@@ -490,6 +498,68 @@ class P2PAllToAll(AllToAllKernel):
             num_routed_mrs.append(num_routed_mr)
             num_routed_descs.append(num_routed_desc)
 
+        node_route_count_ptrs: list[list[int]] = [[] for _ in range(num_slots)]
+        node_route_epoch_ptrs: list[list[int]] = [[] for _ in range(num_slots)]
+        self._node_route_shms: list[shared_memory.SharedMemory] = []
+        self._owned_node_route_shms: list[shared_memory.SharedMemory] = []
+        if self._node_group is not None and world_size == self._node_group.size:
+            # Single-node route counts are tiny. Keep them off the CXI fabric by
+            # publishing each rank's count row in node-local shared memory.
+            count_bytes = num_experts * torch.uint32.itemsize
+            slot_bytes = round_up(count_bytes + torch.uint32.itemsize, _PAGE_SIZE)
+            local_shms = [
+                shared_memory.SharedMemory(create=True, size=slot_bytes)
+                for _ in range(num_slots)
+            ]
+            for shm in local_shms:
+                shm.buf[:] = b"\0" * len(shm.buf)
+            self._owned_node_route_shms.extend(local_shms)
+            local_route_data = _NodeRouteShmData(
+                names=[shm.name for shm in local_shms],
+                sizes=[slot_bytes for _ in local_shms],
+            )
+            gathered_route_data = self._node_group.all_gather_object(
+                pickle.dumps(local_route_data)
+            )
+            peer_shms_by_slot: list[list[shared_memory.SharedMemory]] = [
+                [] for _ in range(num_slots)
+            ]
+            for peer, payload in enumerate(gathered_route_data):
+                assert payload is not None
+                route_data = pickle.loads(payload)
+                assert isinstance(route_data, _NodeRouteShmData)
+                if (
+                    len(route_data.names) != num_slots
+                    or len(route_data.sizes) != num_slots
+                ):
+                    raise RuntimeError(
+                        "Peer route shared-memory slot count mismatch: "
+                        f"expected {num_slots}, got names={len(route_data.names)} "
+                        f"sizes={len(route_data.sizes)}"
+                    )
+                for slot, (name, size) in enumerate(
+                    zip(route_data.names, route_data.sizes)
+                ):
+                    if peer == self._node_group.rank:
+                        shm = local_shms[slot]
+                    else:
+                        shm = shared_memory.SharedMemory(name=name)
+                        self._node_route_shms.append(shm)
+                    if size < slot_bytes:
+                        raise RuntimeError(
+                            "Peer route shared-memory segment is too small: "
+                            f"expected {slot_bytes}, got {size}"
+                        )
+                    peer_shms_by_slot[slot].append(shm)
+                del route_data
+            for slot, peer_shms in enumerate(peer_shms_by_slot):
+                for shm in peer_shms:
+                    base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm.buf))
+                    node_route_count_ptrs[slot].append(base_ptr)
+                    node_route_epoch_ptrs[slot].append(base_ptr + count_bytes)
+            self._node_group.barrier()
+            del local_route_data
+
         # Allocate a a buffer to send from.
         token_dim_dispatch = round_up(hidden_dim * in_dtype.itemsize, 16) + 16
         if hidden_dim_scale is not None or scale_dtype is not None:
@@ -682,6 +752,8 @@ class P2PAllToAll(AllToAllKernel):
             sync_ptrs=sync_ptrs,
             send_ptrs=send_ptrs,
             recv_ptrs=recv_ptrs,
+            node_route_count_ptrs=node_route_count_ptrs,
+            node_route_epoch_ptrs=node_route_epoch_ptrs,
             device=device.index,
             imm_base=imm_base,
             ranks=ranks,
@@ -1385,3 +1457,11 @@ class P2PAllToAll(AllToAllKernel):
             self._transfer_engine.stop()
             del self._transfer_engine
             self._transfer_engine = None
+
+        for shm in getattr(self, "_node_route_shms", []):
+            shm.close()
+        self._node_route_shms = []
+        for shm in getattr(self, "_owned_node_route_shms", []):
+            shm.close()
+            shm.unlink()
+        self._owned_node_route_shms = []

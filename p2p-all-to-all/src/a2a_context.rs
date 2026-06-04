@@ -241,6 +241,8 @@ impl AllToAllContext {
         sync_ptrs: Vec<Vec<u64>>,
         send_ptrs: Vec<Vec<u64>>,
         recv_ptrs: Vec<Vec<u64>>,
+        node_route_count_ptrs: Vec<Vec<u64>>,
+        node_route_epoch_ptrs: Vec<Vec<u64>>,
         device: u8,
         imm_base: u32,
         rank_handles: Vec<Vec<AllToAllRankHandle>>,
@@ -295,6 +297,16 @@ impl AllToAllContext {
                 recv_ptrs.len()
             ));
         }
+        if node_route_count_ptrs.len() != num_slots
+            || node_route_epoch_ptrs.len() != num_slots
+        {
+            return Err(anyhow!(
+                "Expected {} node route pointer sets, got counts {} epochs {}",
+                num_slots,
+                node_route_count_ptrs.len(),
+                node_route_epoch_ptrs.len()
+            ));
+        }
         let slot_pool = Arc::new(SlotPool::new(num_slots));
 
         let mut workers = Vec::with_capacity(num_slots);
@@ -338,6 +350,14 @@ impl AllToAllContext {
                 send_buffer_mrs[slot_idx],
                 recv_buffer_ptrs[slot_idx],
                 recv_buffer_mrs[slot_idx],
+                node_route_count_ptrs[slot_idx]
+                    .iter()
+                    .map(|ptr| *ptr as usize)
+                    .collect(),
+                node_route_epoch_ptrs[slot_idx]
+                    .iter()
+                    .map(|ptr| *ptr as usize)
+                    .collect(),
                 device,
                 slot_imm_base,
                 rank_handles[slot_idx].clone(),
@@ -713,11 +733,7 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX dispatch_send rank={} slot={} epoch={} launching kernel num_tokens={} stream={}",
-                rank,
-                slot,
-                epoch,
-                num_tokens,
-                stream,
+                rank, slot, epoch, num_tokens, stream,
             );
         }
 
@@ -764,14 +780,14 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX dispatch_send rank={} slot={} epoch={} kernel launch returned",
-                rank,
-                slot,
-                epoch,
+                rank, slot, epoch,
             );
         }
 
         if worker.failed() {
-            return Err(anyhow!("a2a_dispatch_send slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_dispatch_send slot {slot}: fabric-lib transfer error"
+            ));
         }
         Ok(())
     }
@@ -841,7 +857,9 @@ impl AllToAllContext {
         .map_err(|e| anyhow!("a2a_dispatch_recv slot {slot}: {e}"))?;
 
         if worker.failed() {
-            return Err(anyhow!("a2a_dispatch_recv slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_dispatch_recv slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         self.transition_dispatch_received(slot, generation)?;
@@ -876,9 +894,7 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX combine_send rank={} slot={} epoch={} launching kernel",
-                rank,
-                slot,
-                epoch
+                rank, slot, epoch
             );
         }
 
@@ -910,14 +926,14 @@ impl AllToAllContext {
         if trace {
             eprintln!(
                 "PPLX combine_send rank={} slot={} epoch={} kernel launch returned",
-                rank,
-                slot,
-                epoch
+                rank, slot, epoch
             );
         }
 
         if worker.failed() {
-            return Err(anyhow!("a2a_combine_send slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_combine_send slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         self.transition_combine_sent(slot, generation)?;
@@ -1029,7 +1045,9 @@ impl AllToAllContext {
         .map_err(|e| anyhow!("a2a_combine_recv slot {slot}: {e}"))?;
 
         if worker.failed() {
-            return Err(anyhow!("a2a_combine_recv slot {slot}: fabric-lib transfer error"));
+            return Err(anyhow!(
+                "a2a_combine_recv slot {slot}: fabric-lib transfer error"
+            ));
         }
 
         self.release_handle(slot, generation)?;
@@ -1161,39 +1179,28 @@ impl AllToAllContext {
             {
                 *dst += value.load(Ordering::Relaxed);
             }
-            stats.wait_dispatch_route_ns += worker
-                .accumulated_wait_dispatch_route_ns
-                .load(Ordering::Relaxed);
-            stats.route_exchange_ns += worker
-                .accumulated_route_exchange_ns
-                .load(Ordering::Relaxed);
-            stats.process_routing_ns += worker
-                .accumulated_process_routing_ns
-                .load(Ordering::Relaxed);
-            stats.wait_dispatch_send_ns += worker
-                .accumulated_wait_dispatch_send_ns
-                .load(Ordering::Relaxed);
-            stats.dispatch_transfer_wait_ns += worker
-                .accumulated_dispatch_transfer_wait_ns
-                .load(Ordering::Relaxed);
-            stats.wait_dispatch_recv_ns += worker
-                .accumulated_wait_dispatch_recv_ns
-                .load(Ordering::Relaxed);
-            stats.dispatch_barrier_ns += worker
-                .accumulated_dispatch_barrier_ns
-                .load(Ordering::Relaxed);
-            stats.wait_combine_send_ns += worker
-                .accumulated_wait_combine_send_ns
-                .load(Ordering::Relaxed);
-            stats.combine_transfer_wait_ns += worker
-                .accumulated_combine_transfer_wait_ns
-                .load(Ordering::Relaxed);
-            stats.wait_combine_recv_ns += worker
-                .accumulated_wait_combine_recv_ns
-                .load(Ordering::Relaxed);
-            stats.combine_barrier_ns += worker
-                .accumulated_combine_barrier_ns
-                .load(Ordering::Relaxed);
+            stats.wait_dispatch_route_ns +=
+                worker.accumulated_wait_dispatch_route_ns.load(Ordering::Relaxed);
+            stats.route_exchange_ns +=
+                worker.accumulated_route_exchange_ns.load(Ordering::Relaxed);
+            stats.process_routing_ns +=
+                worker.accumulated_process_routing_ns.load(Ordering::Relaxed);
+            stats.wait_dispatch_send_ns +=
+                worker.accumulated_wait_dispatch_send_ns.load(Ordering::Relaxed);
+            stats.dispatch_transfer_wait_ns +=
+                worker.accumulated_dispatch_transfer_wait_ns.load(Ordering::Relaxed);
+            stats.wait_dispatch_recv_ns +=
+                worker.accumulated_wait_dispatch_recv_ns.load(Ordering::Relaxed);
+            stats.dispatch_barrier_ns +=
+                worker.accumulated_dispatch_barrier_ns.load(Ordering::Relaxed);
+            stats.wait_combine_send_ns +=
+                worker.accumulated_wait_combine_send_ns.load(Ordering::Relaxed);
+            stats.combine_transfer_wait_ns +=
+                worker.accumulated_combine_transfer_wait_ns.load(Ordering::Relaxed);
+            stats.wait_combine_recv_ns +=
+                worker.accumulated_wait_combine_recv_ns.load(Ordering::Relaxed);
+            stats.combine_barrier_ns +=
+                worker.accumulated_combine_barrier_ns.load(Ordering::Relaxed);
         }
         stats
     }
