@@ -270,6 +270,22 @@ def _test_p2p_all_to_all_worker(
                 and all(ptr != 0 for ptr in slot_ptrs)
                 for slot_ptrs in ll_workspace_ptrs
             )
+            ll_workspace_tensor_ptrs = (
+                all_to_all.debug_low_latency_workspace_tensor_ptrs()
+            )
+            assert set(ll_workspace_tensor_ptrs) >= {
+                "expert_num_tokens",
+                "expert_x",
+                "indices",
+                "weights",
+                "dp_x",
+            }
+            assert all(
+                len(slot_ptrs) == expected_workspace_peers
+                and all(ptr != 0 for ptr in slot_ptrs)
+                for tensor_ptrs in ll_workspace_tensor_ptrs.values()
+                for slot_ptrs in tensor_ptrs
+            )
             (
                 ll_expert_x,
                 ll_expert_x_scale,
@@ -284,6 +300,25 @@ def _test_p2p_all_to_all_worker(
                 slot_key=0,
             )
             assert ll_dispatch_handle._slot == 0
+            assert (
+                ll_workspace_tensor_ptrs["expert_x"][0][
+                    node_group.rank if node_group is not None else 0
+                ]
+                == ll_expert_x.data_ptr()
+            )
+            assert (
+                ll_workspace_tensor_ptrs["expert_num_tokens"][0][
+                    node_group.rank if node_group is not None else 0
+                ]
+                == ll_expert_num_tokens.data_ptr()
+            )
+            if ll_expert_x_scale is not None:
+                assert (
+                    ll_workspace_tensor_ptrs["expert_x_scale"][0][
+                        node_group.rank if node_group is not None else 0
+                    ]
+                    == ll_expert_x_scale.data_ptr()
+                )
             assert ll_dispatch_handle.active_rank_bound == (
                 global_group.size // tp_group.size
             )

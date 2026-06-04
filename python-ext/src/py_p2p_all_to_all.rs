@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::c_void,
     ptr::{null, null_mut},
 };
@@ -291,6 +292,18 @@ impl PyAllToAllContext {
         self.ctx.set_low_latency_workspace_ptrs(workspace_ptrs).map_err(|e| {
             PyRuntimeError::new_err(format!(
                 "Failed to set low-latency workspace pointers: {}",
+                e
+            ))
+        })
+    }
+
+    fn set_low_latency_workspace_tensor_ptrs(
+        &mut self,
+        tensor_ptrs: HashMap<String, Vec<Vec<u64>>>,
+    ) -> PyResult<()> {
+        self.ctx.set_low_latency_workspace_tensor_ptrs(tensor_ptrs).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to set low-latency workspace tensor pointers: {}",
                 e
             ))
         })

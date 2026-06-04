@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::c_void,
     ptr::null_mut,
     sync::{
@@ -110,6 +111,12 @@ struct DeviceWorkspace {
     recv_ptrs: Option<CudaDeviceMemory>,
     /// Device-side low-latency workspace base pointers for same-node peers.
     low_latency_workspace_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency BatchedExperts activation pointers.
+    low_latency_expert_x_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency BatchedExperts scale pointers.
+    low_latency_expert_x_scale_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency per-expert count pointers.
+    low_latency_expert_num_tokens_ptrs: Option<CudaDeviceMemory>,
 }
 
 impl DeviceWorkspace {
@@ -177,6 +184,9 @@ impl DeviceWorkspace {
             send_ptrs,
             recv_ptrs,
             low_latency_workspace_ptrs: None,
+            low_latency_expert_x_ptrs: None,
+            low_latency_expert_x_scale_ptrs: None,
+            low_latency_expert_num_tokens_ptrs: None,
         })
     }
 
@@ -204,6 +214,42 @@ impl DeviceWorkspace {
     #[allow(dead_code)]
     fn get_low_latency_workspace_ptr(&mut self) -> *mut *mut c_void {
         self.low_latency_workspace_ptrs.as_mut().map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    fn set_low_latency_workspace_tensor_ptrs(
+        &mut self,
+        expert_x_ptrs: &[u64],
+        expert_x_scale_ptrs: Option<&[u64]>,
+        expert_num_tokens_ptrs: &[u64],
+    ) -> Result<(), CudartError> {
+        self.low_latency_expert_x_ptrs =
+            Some(CudaDeviceMemory::from_vec(expert_x_ptrs)?);
+        self.low_latency_expert_x_scale_ptrs = match expert_x_scale_ptrs {
+            Some(ptrs) => Some(CudaDeviceMemory::from_vec(ptrs)?),
+            None => None,
+        };
+        self.low_latency_expert_num_tokens_ptrs =
+            Some(CudaDeviceMemory::from_vec(expert_num_tokens_ptrs)?);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn get_low_latency_expert_x_ptr(&mut self) -> *mut *mut c_void {
+        self.low_latency_expert_x_ptrs.as_mut().map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    #[allow(dead_code)]
+    fn get_low_latency_expert_x_scale_ptr(&mut self) -> *mut *mut c_void {
+        self.low_latency_expert_x_scale_ptrs
+            .as_mut()
+            .map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    #[allow(dead_code)]
+    fn get_low_latency_expert_num_tokens_ptr(&mut self) -> *mut *mut c_void {
+        self.low_latency_expert_num_tokens_ptrs
+            .as_mut()
+            .map_or(null_mut(), |p| p.get_mut_ptr())
     }
 }
 
@@ -533,6 +579,63 @@ impl AllToAllContext {
             workspace.set_low_latency_workspace_ptrs(slot_ptrs)?;
         }
         Ok(())
+    }
+
+    pub fn set_low_latency_workspace_tensor_ptrs(
+        &mut self,
+        tensor_ptrs: HashMap<String, Vec<Vec<u64>>>,
+    ) -> Result<()> {
+        let expert_x_ptrs = self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_x")?;
+        let expert_num_tokens_ptrs =
+            self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_num_tokens")?;
+        let expert_x_scale_ptrs = if self.scale_elemsize > 0 {
+            Some(self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_x_scale")?)
+        } else {
+            None
+        };
+
+        for slot in 0..self.workspaces.len() {
+            self.workspace_mut(slot)?.set_low_latency_workspace_tensor_ptrs(
+                &expert_x_ptrs[slot],
+                expert_x_scale_ptrs.as_ref().map(|ptrs| ptrs[slot].as_slice()),
+                &expert_num_tokens_ptrs[slot],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn low_latency_tensor_ptrs<'a>(
+        &self,
+        tensor_ptrs: &'a HashMap<String, Vec<Vec<u64>>>,
+        name: &str,
+    ) -> Result<&'a Vec<Vec<u64>>> {
+        let ptrs = tensor_ptrs.get(name).ok_or_else(|| {
+            anyhow!("Missing low-latency workspace tensor pointer table for {name}")
+        })?;
+        if ptrs.len() != self.workspaces.len() {
+            return Err(anyhow!(
+                "Expected {} low-latency {name} pointer sets, got {}",
+                self.workspaces.len(),
+                ptrs.len()
+            ));
+        }
+        for (slot, slot_ptrs) in ptrs.iter().enumerate() {
+            if slot_ptrs.len() != self.node_size {
+                return Err(anyhow!(
+                    "Expected {} low-latency {name} pointers for slot {}, got {}",
+                    self.node_size,
+                    slot,
+                    slot_ptrs.len()
+                ));
+            }
+            if slot_ptrs.contains(&0) {
+                return Err(anyhow!(
+                    "Low-latency {name} pointer set for slot {} contains null",
+                    slot
+                ));
+            }
+        }
+        Ok(ptrs)
     }
 
     fn slot_state(&self, slot: usize) -> Result<&Mutex<SlotGenerationState>> {

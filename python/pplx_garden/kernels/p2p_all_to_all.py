@@ -482,6 +482,7 @@ class P2PAllToAll(AllToAllKernel):
             list[_LowLatencyWorkspacePeerMapping]
         ] = []
         self._low_latency_workspace_ptrs: list[list[int]] = []
+        self._low_latency_workspace_tensor_ptrs: dict[str, list[list[int]]] = {}
 
         # Detect topology and identify NICs and CPUs.
         system_topo = TransferEngine.detect_topology()
@@ -883,8 +884,25 @@ class P2PAllToAll(AllToAllKernel):
                 [self._low_latency_workspace_pool.local_mapping(slot).data_ptr()]
                 for slot in range(self._num_slots)
             ]
+        assert self._low_latency_workspace_layout is not None
+        workspace_tensor_offsets = {
+            name: int(spec["offset_bytes"])
+            for name, spec in self._low_latency_workspace_layout[
+                "tensors"
+            ].items()
+        }
+        self._low_latency_workspace_tensor_ptrs = {
+            name: [
+                [base_ptr + offset for base_ptr in slot_ptrs]
+                for slot_ptrs in self._low_latency_workspace_ptrs
+            ]
+            for name, offset in workspace_tensor_offsets.items()
+        }
         self._all_to_all.set_low_latency_workspace_ptrs(
             self._low_latency_workspace_ptrs
+        )
+        self._all_to_all.set_low_latency_workspace_tensor_ptrs(
+            self._low_latency_workspace_tensor_ptrs
         )
 
         # Ensure that all ranks start the workers threads and registered imm callbacks.
@@ -1570,6 +1588,14 @@ class P2PAllToAll(AllToAllKernel):
 
         return [list(slot_ptrs) for slot_ptrs in self._low_latency_workspace_ptrs]
 
+    def debug_low_latency_workspace_tensor_ptrs(self) -> dict[str, list[list[int]]]:
+        """Return same-node low-latency workspace tensor pointers for tests."""
+
+        return {
+            name: [list(slot_ptrs) for slot_ptrs in ptrs]
+            for name, ptrs in self._low_latency_workspace_tensor_ptrs.items()
+        }
+
     @override
     def destroy(self) -> None:
         """Clean up the all-to-all context."""
@@ -1579,6 +1605,7 @@ class P2PAllToAll(AllToAllKernel):
         self._all_to_all = None
         self._low_latency_workspace_layout = None
         self._low_latency_workspace_ptrs = []
+        self._low_latency_workspace_tensor_ptrs = {}
         self._low_latency_workspace_nvl_mappings = []
         self._low_latency_workspace_pool.clear()
 
