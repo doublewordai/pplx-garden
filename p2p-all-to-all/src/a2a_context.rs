@@ -1129,7 +1129,7 @@ impl AllToAllContext {
             worker.slot.tx_ready.get_device_ptr(),
             worker.buffers.send_buffer_ptr as *mut u8,
             worker.buffers.recv_buffer_ptr as *mut u8,
-            worker.slot.source_rank.get_device_ptr(),
+            worker.slot.source_rank_by_final_index.get_device_ptr(),
             worker.slot.combine_send_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
             worker.slot.num_recv_tokens.get_device_ptr(),

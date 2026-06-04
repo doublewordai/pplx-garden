@@ -127,7 +127,7 @@ int a2a_combine_send(
     uint8_t *tx_ready,
     uint8_t *send_buffer,
     uint8_t *recv_buffer,
-    uint32_t *source_rank,
+    uint32_t *source_rank_by_final_index,
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *num_recv_tokens_ptr,

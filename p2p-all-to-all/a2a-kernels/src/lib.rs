@@ -121,7 +121,7 @@ mod ffi {
             tx_ready: *mut u8,
             send_buffer: *mut u8,
             recv_buffer: *mut u8,
-            source_rank: *mut u32,
+            source_rank_by_final_index: *mut u32,
             combine_send_offset: *mut u32,
             padded_index: *mut u32,
             num_recv_tokens_ptr: *mut u32,

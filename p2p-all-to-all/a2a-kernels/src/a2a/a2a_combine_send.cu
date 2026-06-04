@@ -39,7 +39,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     uint8_t * __restrict__ tx_ready,
     std::byte * __restrict__ send_buffer,
     std::byte * __restrict__ recv_buffer,
-    uint32_t * __restrict__ source_rank,
+    uint32_t * __restrict__ source_rank_by_final_index,
     uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
     const uint32_t * __restrict__ num_recv_tokens_ptr,
@@ -108,9 +108,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     } else if (warp_id == 2) {
         unsigned next_token = token + lane_id * gridDim.x;
         if (next_token < num_recv_tokens && lane_id < NUM_STAGES) {
+            auto index = padded_index[next_token];
             shared_stages[lane_id].offset = combine_send_offset[next_token];
-            shared_stages[lane_id].index = padded_index[next_token];
-            shared_stages[lane_id].rank = source_rank[next_token];
+            shared_stages[lane_id].index = index;
+            shared_stages[lane_id].rank = source_rank_by_final_index[index];
         }
     }
     __syncthreads();
@@ -130,9 +131,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         // Fetch the next batch.
         unsigned next_token = token + (NUM_STAGES + threadIdx.x) * gridDim.x;
         if (threadIdx.x < NUM_STAGES && next_token < num_efa_tokens) {
+            auto index = padded_index[next_token];
             shared_stages[threadIdx.x].offset = combine_send_offset[next_token];
-            shared_stages[threadIdx.x].index = padded_index[next_token];
-            shared_stages[threadIdx.x].rank = source_rank[next_token];
+            shared_stages[threadIdx.x].index = index;
+            shared_stages[threadIdx.x].rank = source_rank_by_final_index[index];
         }
         __syncthreads();
 
@@ -179,9 +181,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     if (warp_id == 0) {
         unsigned next_token = token + lane_id * gridDim.x;
         if (next_token < num_recv_tokens && lane_id < NUM_STAGES) {
+            auto index = padded_index[next_token];
             shared_stages[lane_id].offset = combine_send_offset[next_token];
-            shared_stages[lane_id].index = padded_index[next_token];
-            shared_stages[lane_id].rank = source_rank[next_token];
+            shared_stages[lane_id].index = index;
+            shared_stages[lane_id].rank = source_rank_by_final_index[index];
         }
     }
     __syncthreads();
@@ -194,9 +197,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         // Fetch the next batch.
         unsigned next_token = token + (NUM_STAGES + threadIdx.x) * gridDim.x;
         if (threadIdx.x < NUM_STAGES && next_token < num_recv_tokens) {
+            auto index = padded_index[next_token];
             shared_stages[threadIdx.x].offset = combine_send_offset[next_token];
-            shared_stages[threadIdx.x].index = padded_index[next_token];
-            shared_stages[threadIdx.x].rank = source_rank[next_token];
+            shared_stages[threadIdx.x].index = index;
+            shared_stages[threadIdx.x].rank = source_rank_by_final_index[index];
         }
         __syncthreads();
 
@@ -272,7 +276,7 @@ int a2a_kernels::a2a_combine_send(
     uint8_t *tx_ready,
     uint8_t *send_buffer,
     uint8_t *recv_buffer,
-    uint32_t *source_rank,
+    uint32_t *source_rank_by_final_index,
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *num_recv_tokens_ptr,
@@ -294,7 +298,7 @@ int a2a_kernels::a2a_combine_send(
         &tx_ready,
         &send_buffer,
         &recv_buffer,
-        &source_rank,
+        &source_rank_by_final_index,
         &combine_send_offset,
         &padded_index,
         &num_recv_tokens_ptr,
