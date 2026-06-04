@@ -72,6 +72,7 @@ def expected_canonical_batched_experts_route_plan(
     source_rank: list[int] = []
     source_group: list[int] = []
     final_index: list[int] = []
+    source_token_index: list[int] = []
     tokens_per_expert = [0 for _ in range(num_local_experts)]
     num_source_groups = len(rank_data)
     layout_range = [0 for _ in range(num_local_experts * num_source_groups)]
@@ -84,20 +85,27 @@ def expected_canonical_batched_experts_route_plan(
             layout_range[local_expert * num_source_groups + route_source_group] = (
                 _pack_layout_range(count, tokens_per_expert[local_expert])
             )
-            for _ in range(count):
-                source_rank.append(route_source_rank)
-                source_group.append(route_source_group)
-                final_index.append(
-                    local_expert * max_tokens_per_expert
-                    + tokens_per_expert[local_expert]
-                )
-                tokens_per_expert[local_expert] += 1
+            source = rank_data[route_source_group]
+            for token_idx in range(source.indices.shape[0]):
+                for topk_idx in range(source.indices.shape[1]):
+                    expert = int(source.indices[token_idx, topk_idx].item())
+                    if expert != first_expert + local_expert:
+                        continue
+                    source_rank.append(route_source_rank)
+                    source_group.append(route_source_group)
+                    final_index.append(
+                        local_expert * max_tokens_per_expert
+                        + tokens_per_expert[local_expert]
+                    )
+                    source_token_index.append(token_idx)
+                    tokens_per_expert[local_expert] += 1
 
     return {
         "source_group_order": source_group_order,
         "source_rank": source_rank,
         "source_group": source_group,
         "final_index": final_index,
+        "source_token_index": source_token_index,
         "tokens_per_source_group_per_local_expert": (
             tokens_per_source_group_per_local_expert
         ),

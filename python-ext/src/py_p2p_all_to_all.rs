@@ -23,6 +23,7 @@ fn low_latency_route_layout_plan_to_dict<'py>(
     dict.set_item("source_rank", plan.source_rank)?;
     dict.set_item("source_group", plan.source_group)?;
     dict.set_item("final_index", plan.final_index)?;
+    dict.set_item("source_token_index", plan.source_token_index)?;
     dict.set_item(
         "tokens_per_source_group_per_local_expert",
         plan.tokens_per_source_group_per_local_expert,

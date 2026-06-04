@@ -71,6 +71,7 @@ mod ffi {
             source_rank: *mut u32,
             source_offset: *mut u32,
             padded_index: *mut u32,
+            source_token_index: *mut u32,
             num_routed: *mut u32,
             num_recv_tokens_ptr: *mut u32,
             num_recv_tokens_ready: *mut u32,

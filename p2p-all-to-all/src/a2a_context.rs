@@ -842,6 +842,7 @@ impl AllToAllContext {
             worker.slot.source_rank.get_device_ptr(),
             worker.slot.source_dispatch_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
+            worker.slot.source_token_index.get_device_ptr(),
             worker.buffers.num_routed_ptr,
             worker.slot.num_recv_tokens.get_device_ptr(),
             worker.slot.num_recv_tokens_ready.get_device_ptr(),
@@ -1278,6 +1279,11 @@ impl AllToAllContext {
         );
         plan.layout_range = (0..plan.layout_range.len())
             .map(|index| worker.slot.layout_range.get(index))
+            .collect();
+        plan.source_token_index = plan
+            .final_index
+            .iter()
+            .map(|index| worker.slot.source_token_index.get(*index as usize))
             .collect();
         Ok(plan)
     }

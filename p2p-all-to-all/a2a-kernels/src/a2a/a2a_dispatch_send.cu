@@ -180,6 +180,12 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
 
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
+    auto store_source_token_index = [&](std::byte *token_ptr, uint32_t token) {
+        if (threadIdx.x == 0) {
+            auto *source_token_index = reinterpret_cast<uint32_t*>(token_ptr + token_dim_bound + token_scale_dim);
+            *source_token_index = token;
+        }
+    };
 
     // In the first phase, count how many tokens are sent to each other rank
     // and assign a unique offset to each token within the ranks.
@@ -321,6 +327,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
+                                store_source_token_index(token_ptr, token);
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -330,6 +337,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                             // Always write into the send buffer for local copies.
                             std::byte *token_ptr = send_buffer + route.position * token_stride;
                             uint4 *x_token_dst = (uint4*)token_ptr;
+                            store_source_token_index(token_ptr, token);
                             st_global_nc_uint4(&x_token_dst[i], val);
                             if (has_scale) {
                                 *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -365,6 +373,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
+                        store_source_token_index(token_ptr, token);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
@@ -391,6 +400,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t local_peer = dst_rank % NODE_SIZE;
                         std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
+                        store_source_token_index(token_ptr, token);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
                             const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
                             st_global_nc_uint4(&x_token_dst[i], vals[s]);
@@ -450,6 +460,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
+                        store_source_token_index(token_ptr, token);
                         st_global_nc_uint4(&x_token_dst[i], val);
                         if (has_scale) {
                             *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
@@ -501,6 +512,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                                 const uint32_t local_peer = dst_rank % NODE_SIZE;
                                 std::byte *token_ptr = recv_ptrs[local_peer] + (node_group * max_private_tokens + route.offset) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
+                                store_source_token_index(token_ptr, token);
                                 st_global_nc_uint4(&x_token_dst[i], val);
                                 if (has_scale) {
                                     *((float*)(token_ptr + token_dim_bound) + i) = scale_val;

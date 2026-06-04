@@ -39,6 +39,7 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ source_rank,
     uint32_t * __restrict__ source_offset,
     uint32_t * __restrict__ padded_index,
+    uint32_t * __restrict__ source_token_index,
     uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ num_recv_tokens_ptr,
     uint32_t * __restrict__ num_recv_tokens_ready,
@@ -62,6 +63,7 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_dst;
         float *x_scale_src;
         float *x_scale_dst;
+        uint32_t dst_index;
     };
     constexpr size_t NUM_STAGES = 8;
 
@@ -77,6 +79,7 @@ void a2a_dispatch_recv_kernel(
             local_stage[i].x_scale_src = (float*)(recv_buffer + src_index * token_stride + token_dim_bound);
             local_stage[i].x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
             local_stage[i].x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+            local_stage[i].dst_index = dst_index;
         }
         __syncthreads();
     };
@@ -144,6 +147,10 @@ void a2a_dispatch_recv_kernel(
         }
 
         // Token originates from the local node - copy it from an NVLink buffer.
+        auto source_token = *(uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+        if (threadIdx.x == 0) {
+            source_token_index[padded_token] = source_token;
+        }
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
         float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
         float *x_scale_dst = (float*)(out_x_scale_ptr + padded_token * out_x_scale_stride_token);
@@ -204,6 +211,10 @@ void a2a_dispatch_recv_kernel(
             uint4 *x_token_dst = local_stage[s].x_token_dst;
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
+            if (threadIdx.x == 0) {
+                auto source_token = *(uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+                source_token_index[local_stage[s].dst_index] = source_token;
+            }
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -264,6 +275,7 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t *source_rank,
     uint32_t *source_offset,
     uint32_t *padded_index,
+    uint32_t *source_token_index,
     uint32_t *num_routed,
     uint32_t *num_recv_tokens_ptr,
     uint32_t *num_recv_tokens_ready,
@@ -310,6 +322,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &source_rank,
         &source_offset,
         &padded_index,
+        &source_token_index,
         &num_routed,
         &num_recv_tokens_ptr,
         &num_recv_tokens_ready,

@@ -325,7 +325,13 @@ def _test_p2p_all_to_all_worker(
                 world_size=global_group.size,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
-            assert native_route_plan == expected_route_plan
+            if native_route_plan != expected_route_plan:
+                for key in sorted(expected_route_plan):
+                    if native_route_plan.get(key) != expected_route_plan.get(key):
+                        print(f"route plan mismatch for {key}")
+                        print("native:", native_route_plan.get(key))
+                        print("expected:", expected_route_plan.get(key))
+                assert native_route_plan == expected_route_plan
             if ll_expert_x.dtype == out_dtype:
                 ll_combine_buffer = (
                     all_to_all.get_next_low_latency_combine_buffer(
