@@ -214,6 +214,83 @@ class AllToAllResource:
         )
 
 
+def _byte_counter_is_empty(perf_stats: list[dict]) -> bool:
+    byte_fields = (
+        "local_dispatch_bytes",
+        "nvlink_dispatch_bytes",
+        "network_dispatch_bytes",
+        "local_combine_bytes",
+        "nvlink_combine_bytes",
+        "network_combine_bytes",
+    )
+    return all(sum(int(s.get(field, 0)) for s in perf_stats) == 0 for field in byte_fields)
+
+
+def _replay_single_node_route_byte_stats(
+    r: AllToAllResource,
+    num_iters: int,
+) -> list[dict]:
+    """Replay benchmark routes for telemetry without touching the measured path."""
+    world_size = r.global_group.size
+    experts_per_rank = r.cfg.num_experts // world_size
+    dispatch_token_bytes = r.cfg.dispatch_bytes // (
+        r.cfg.max_num_tokens * r.cfg.num_experts_per_token
+    )
+    combine_token_bytes = r.cfg.combine_bytes // (
+        r.cfg.max_num_tokens * r.cfg.num_experts_per_token
+    )
+
+    dispatch_peer_tokens = [[0 for _ in range(world_size)] for _ in range(world_size)]
+    for src_rank in range(world_size):
+        rng = make_rng(r.device, src_rank)
+        for _ in range(num_iters):
+            topk_idx = rand_topk_idx(
+                r.cfg.max_num_tokens,
+                r.cfg.num_experts,
+                r.cfg.num_experts_per_token,
+                rng,
+                r.device,
+            )
+            dst_ranks = torch.div(
+                topk_idx.to(torch.int64),
+                experts_per_rank,
+                rounding_mode="floor",
+            )
+            counts = torch.bincount(
+                dst_ranks.reshape(-1),
+                minlength=world_size,
+            ).to("cpu")
+            for dst_rank, count in enumerate(counts.tolist()):
+                dispatch_peer_tokens[src_rank][dst_rank] += int(count)
+
+    stats: list[dict] = []
+    for rank in range(world_size):
+        peer_dispatch_bytes = [
+            tokens * dispatch_token_bytes for tokens in dispatch_peer_tokens[rank]
+        ]
+        peer_combine_bytes = [
+            dispatch_peer_tokens[src_rank][rank] * combine_token_bytes
+            for src_rank in range(world_size)
+        ]
+
+        local_dispatch = peer_dispatch_bytes[rank]
+        local_combine = peer_combine_bytes[rank]
+        nvlink_dispatch = sum(peer_dispatch_bytes) - local_dispatch
+        nvlink_combine = sum(peer_combine_bytes) - local_combine
+        stats.append(
+            {
+                "local_dispatch_bytes": local_dispatch,
+                "nvlink_dispatch_bytes": nvlink_dispatch,
+                "network_dispatch_bytes": 0,
+                "local_combine_bytes": local_combine,
+                "nvlink_combine_bytes": nvlink_combine,
+                "network_combine_bytes": 0,
+                "peer_dispatch_bytes": peer_dispatch_bytes,
+                "peer_combine_bytes": peer_combine_bytes,
+            }
+        )
+    return stats
+
 def correctness_check(r: AllToAllResource) -> None:
     expected_num_tokens_list = [
         RankTestData.rand_indices_and_count(
@@ -500,6 +577,23 @@ def benchmark(
     if r.global_group.rank == 0:
         stat_dispatch = Statistics.create(dispatch_times)
         stat_combine = Statistics.create(combine_times)
+        byte_accounting = "backend"
+        if (
+            r.cfg.api == "low-latency"
+            and r.cfg.nvlink == r.global_group.size
+            and r.dp_group.size == 1
+            and _byte_counter_is_empty(all_perf_stats)
+        ):
+            replayed_stats = _replay_single_node_route_byte_stats(
+                r,
+                num_warmup + num_repeats,
+            )
+            for stat, replayed in zip(all_perf_stats, replayed_stats):
+                stat.update(replayed)
+            byte_accounting = "benchmark_replayed_routes"
+            logger.info(
+                "Backend byte counters were empty; using replayed benchmark routes for single-node byte accounting."
+            )
 
         dispatch_bandwidth = r.cfg.dispatch_bytes / stat_dispatch.p50 * 1e-3
         combine_bandwidth = r.cfg.combine_bytes / stat_combine.p50 * 1e-3
@@ -657,6 +751,7 @@ def benchmark(
         data = {
             "dispatch": asdict(stat_dispatch),
             "combine": asdict(stat_combine),
+            "byte_accounting": byte_accounting,
             "perf_stats": all_perf_stats,
         }
 
