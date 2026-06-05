@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,8 +12,23 @@ from pplx_garden.utils import logging_utils
 from pplx_garden.utils.math import round_up
 from pplx_garden.utils.torch import has_tp
 from tests.fabric import get_nets_per_gpu
-from tests.markers import gpu_only, mark_ci_2gpu, mark_ci_4gpu, mark_fabric, mark_kernel
+from tests.markers import (
+    gpu_only,
+    mark_ci_2gpu,
+    mark_ci_4gpu,
+    mark_cuda,
+    mark_distributed,
+    mark_fabric,
+    mark_kernel,
+)
 from tests.p2p_all_to_all.data import RankTestData
+from tests.p2p_all_to_all.layout import (
+    assert_batched_experts_layout_semantics,
+    assert_canonical_batched_experts_layout,
+    expected_canonical_batched_experts_route_plan,
+    expected_combine_from_route_metadata,
+    expected_local_expert_source_contribution,
+)
 
 logger = logging_utils.get_logger(__name__)
 
@@ -39,6 +56,7 @@ class _Config:
     scale_dtype: Optional[torch.dtype]
     expert_padding: int
     nvlink_group: Optional[int]
+    max_tokens_per_expert: Optional[int] = None
 
 
 def _act(x: torch.Tensor, x_scale: Optional[torch.Tensor]) -> torch.Tensor:
@@ -77,8 +95,8 @@ def _test_p2p_all_to_all_worker(
     out_dtype = config.out_dtype
     scale_dtype = config.scale_dtype
 
-    num_local_experts = num_experts // global_group.size
-    first_expert = global_group.rank * num_local_experts
+    num_local_experts = num_experts // num_dp_groups
+    first_expert = dp_rank * num_local_experts
     last_expert = min(first_expert + num_local_experts, num_experts)
 
     max_recv_tokens = max_num_tokens * num_local_experts * num_dp_groups
@@ -128,6 +146,7 @@ def _test_p2p_all_to_all_worker(
         dp_group=tp_group,
         node_group=node_group,
         global_group=global_group,
+        max_tokens_per_expert=config.max_tokens_per_expert,
     )
 
     try:
@@ -146,11 +165,15 @@ def _test_p2p_all_to_all_worker(
             dtype=torch.int32,
             device=device,
         )
-        out_expert_x = torch.empty(
-            (max_recv_tokens, hidden_dim),
-            dtype=in_dtype,
-            device=device,
-        )
+        if config.max_tokens_per_expert is None:
+            out_expert_x_shape = (max_recv_tokens, hidden_dim)
+        else:
+            out_expert_x_shape = (
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+        out_expert_x = torch.empty(out_expert_x_shape, dtype=in_dtype, device=device)
         out_tokens = torch.empty(
             (max_num_tokens, hidden_dim),
             dtype=out_dtype,
@@ -160,10 +183,16 @@ def _test_p2p_all_to_all_worker(
         if hidden_dim_scale is not None or scale_dtype is not None:
             assert scale_dtype is not None
             assert hidden_dim_scale is not None
+            if config.max_tokens_per_expert is None:
+                out_expert_x_scale_shape = (max_recv_tokens, hidden_dim_scale)
+            else:
+                out_expert_x_scale_shape = (
+                    num_local_experts,
+                    config.max_tokens_per_expert,
+                    hidden_dim_scale,
+                )
             out_expert_x_scale = torch.empty(
-                (max_recv_tokens, hidden_dim_scale),
-                dtype=scale_dtype,
-                device=device,
+                out_expert_x_scale_shape, dtype=scale_dtype, device=device
             )
         else:
             out_expert_x_scale = None
@@ -179,7 +208,21 @@ def _test_p2p_all_to_all_worker(
             weights=local_rank.weights,
             bound_m=None,
         )
-        expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
+        if out_expert_x.ndim == 3:
+            flat_out_expert_x = out_expert_x.reshape(-1, hidden_dim)
+            flat_out_expert_x_scale = (
+                None
+                if out_expert_x_scale is None
+                else out_expert_x_scale.reshape(-1, hidden_dim_scale)
+            )
+            expert_y = _act(flat_out_expert_x, flat_out_expert_x_scale).to(out_dtype)
+            expert_y = expert_y.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+        else:
+            expert_y = _act(out_expert_x, out_expert_x_scale).to(out_dtype)
         all_to_all.combine(
             out_tokens=out_tokens,
             indices=local_rank.indices,
@@ -199,11 +242,364 @@ def _test_p2p_all_to_all_worker(
 
         tokens_on_rank = set()
         index = 0
-        for n in expected_local_tokens.tolist():
-            for token in out_expert_x[index : index + n]:
+        for expert, n in enumerate(expected_local_tokens.tolist()):
+            if out_expert_x.ndim == 3:
+                expert_tokens = out_expert_x[expert, :n]
+            else:
+                expert_tokens = out_expert_x[index : index + n]
+            for token in expert_tokens:
                 tokens_on_rank.add(hash_token(token))
+            if out_expert_x.ndim == 2:
+                index = round_up(index + n, config.expert_padding)
 
-            index = round_up(index + n, config.expert_padding)
+        # Verify the backend-owned low-latency API used by vLLM's NIXL-like
+        # PrepareAndFinalize path.
+        if config.max_tokens_per_expert is not None:
+            expected_node_route_exchange = (
+                config.nvlink_group is not None
+                and config.nvlink_group == config.world_size
+            )
+            assert (
+                all_to_all.uses_node_route_exchange()
+                == expected_node_route_exchange
+            )
+            ll_workspace_ptrs = all_to_all.debug_low_latency_workspace_ptrs()
+            expected_workspace_peers = (
+                node_group.size if node_group is not None else 1
+            )
+            assert len(ll_workspace_ptrs) == 2
+            assert all(
+                len(slot_ptrs) == expected_workspace_peers
+                and all(ptr != 0 for ptr in slot_ptrs)
+                for slot_ptrs in ll_workspace_ptrs
+            )
+            ll_workspace_tensor_ptrs = (
+                all_to_all.debug_low_latency_workspace_tensor_ptrs()
+            )
+            assert set(ll_workspace_tensor_ptrs) >= {
+                "expert_num_tokens",
+                "expert_x",
+                "indices",
+                "weights",
+                "dp_x",
+            }
+            assert all(
+                len(slot_ptrs) == expected_workspace_peers
+                and all(ptr != 0 for ptr in slot_ptrs)
+                for tensor_ptrs in ll_workspace_tensor_ptrs.values()
+                for slot_ptrs in tensor_ptrs
+            )
+            (
+                ll_expert_x,
+                ll_expert_x_scale,
+                ll_expert_num_tokens,
+                ll_dispatch_handle,
+                ll_dispatch_recv,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
+            )
+            assert ll_dispatch_handle._slot == 0
+            assert (
+                ll_workspace_tensor_ptrs["expert_x"][0][
+                    node_group.rank if node_group is not None else 0
+                ]
+                == ll_expert_x.data_ptr()
+            )
+            assert (
+                ll_workspace_tensor_ptrs["expert_num_tokens"][0][
+                    node_group.rank if node_group is not None else 0
+                ]
+                == ll_expert_num_tokens.data_ptr()
+            )
+            if ll_expert_x_scale is not None:
+                assert (
+                    ll_workspace_tensor_ptrs["expert_x_scale"][0][
+                        node_group.rank if node_group is not None else 0
+                    ]
+                    == ll_expert_x_scale.data_ptr()
+                )
+            assert ll_dispatch_handle.active_rank_bound == (
+                global_group.size // tp_group.size
+            )
+            assert (
+                ll_dispatch_handle.batched_expert_capacity
+                == config.max_tokens_per_expert
+            )
+            assert (
+                ll_dispatch_handle.num_max_dispatch_tokens_per_rank
+                * ll_dispatch_handle.active_rank_bound
+                == ll_dispatch_handle.batched_expert_capacity
+            )
+            ll_dispatch_recv()
+            torch.cuda.synchronize()
+            with pytest.raises(RuntimeError, match="already in use"):
+                all_to_all.low_latency_dispatch(
+                    local_rank.dp_x,
+                    local_rank.indices,
+                    local_rank.weights,
+                    local_rank.dp_x_scale,
+                    slot_key=0,
+                )
+            assert_batched_experts_layout_semantics(
+                out_expert_x=ll_expert_x,
+                out_expert_x_scale=ll_expert_x_scale,
+                expert_num_tokens=ll_expert_num_tokens,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            assert_canonical_batched_experts_layout(
+                out_expert_x=ll_expert_x,
+                out_expert_x_scale=ll_expert_x_scale,
+                expert_num_tokens=ll_expert_num_tokens,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            native_route_plan = ll_dispatch_handle.debug_route_layout_plan()
+            expected_route_plan = expected_canonical_batched_experts_route_plan(
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            comparable_native_route_plan = {
+                key: native_route_plan[key] for key in expected_route_plan
+            }
+            if comparable_native_route_plan != expected_route_plan:
+                for key in sorted(expected_route_plan):
+                    if native_route_plan.get(key) != expected_route_plan.get(key):
+                        print(f"route plan mismatch for {key}")
+                        print("native:", native_route_plan.get(key))
+                        print("expected:", expected_route_plan.get(key))
+                assert comparable_native_route_plan == expected_route_plan
+
+            (
+                ll_expert_x_interleaved,
+                ll_expert_x_scale_interleaved,
+                ll_expert_num_tokens_interleaved,
+                ll_dispatch_handle_interleaved,
+                ll_dispatch_recv_interleaved,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=1,
+            )
+            assert ll_dispatch_handle_interleaved._slot == 1
+            ll_dispatch_recv_interleaved()
+            torch.cuda.synchronize()
+            assert_batched_experts_layout_semantics(
+                out_expert_x=ll_expert_x_interleaved,
+                out_expert_x_scale=ll_expert_x_scale_interleaved,
+                expert_num_tokens=ll_expert_num_tokens_interleaved,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            assert_canonical_batched_experts_layout(
+                out_expert_x=ll_expert_x_interleaved,
+                out_expert_x_scale=ll_expert_x_scale_interleaved,
+                expert_num_tokens=ll_expert_num_tokens_interleaved,
+                rank_data=rank_data,
+                first_expert=first_expert,
+                num_local_experts=num_local_experts,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                node_size=(
+                    node_group.size if node_group is not None else tp_group.size
+                ),
+                world_size=global_group.size,
+                expert_padding=config.expert_padding,
+                max_tokens_per_expert=config.max_tokens_per_expert,
+            )
+            interleaved_route_plan = (
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
+            )
+            comparable_interleaved_route_plan = {
+                key: interleaved_route_plan[key] for key in expected_route_plan
+            }
+            assert comparable_interleaved_route_plan == expected_route_plan
+
+            if ll_expert_x.dtype == out_dtype:
+                ll_combine_buffer = (
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle
+                    )
+                )
+                assert ll_combine_buffer.data_ptr() == ll_expert_x.data_ptr()
+                assert ll_combine_buffer.shape == ll_expert_x.shape
+            else:
+                with pytest.raises(RuntimeError, match="without an extra allocation"):
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle
+                    )
+            ll_expert_y = _act(
+                ll_expert_x.reshape(-1, hidden_dim),
+                (
+                    None
+                    if ll_expert_x_scale is None
+                    else ll_expert_x_scale.reshape(-1, hidden_dim_scale)
+                ),
+            ).to(out_dtype)
+            ll_expert_y = ll_expert_y.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+            metadata_ref_out_tokens = expected_combine_from_route_metadata(
+                expert_y=ll_expert_y,
+                route_plan=native_route_plan,
+                rank_data=rank_data,
+                rank=global_group.rank,
+                dp_size=tp_group.size,
+                out_dtype=out_dtype,
+            )
+            local_expert_ref_out_tokens = (
+                expected_local_expert_source_contribution(
+                    source=local_rank,
+                    activated_source_x=ref_out_tokens,
+                    first_expert=first_expert,
+                    num_local_experts=num_local_experts,
+                    out_dtype=out_dtype,
+                )
+            )
+            torch.testing.assert_close(
+                metadata_ref_out_tokens,
+                local_expert_ref_out_tokens,
+            )
+            ll_out_tokens = torch.empty_like(out_tokens)
+            _ll_combine_handle, ll_combine_recv = all_to_all.low_latency_combine(
+                ll_expert_y,
+                ll_dispatch_handle,
+                out=ll_out_tokens,
+                bound_m=local_rank.bound_m,
+            )
+            ll_combine_recv()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ll_out_tokens, ref_out_tokens)
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                ll_dispatch_handle.debug_route_layout_plan()
+
+            ll_expert_y_interleaved = _act(
+                ll_expert_x_interleaved.reshape(-1, hidden_dim),
+                (
+                    None
+                    if ll_expert_x_scale_interleaved is None
+                    else ll_expert_x_scale_interleaved.reshape(-1, hidden_dim_scale)
+                ),
+            ).to(out_dtype)
+            ll_expert_y_interleaved = ll_expert_y_interleaved.reshape(
+                num_local_experts,
+                config.max_tokens_per_expert,
+                hidden_dim,
+            )
+            interleaved_route_plan_for_combine = (
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
+            )
+            metadata_ref_out_tokens_interleaved = (
+                expected_combine_from_route_metadata(
+                    expert_y=ll_expert_y_interleaved,
+                    route_plan=interleaved_route_plan_for_combine,
+                    rank_data=rank_data,
+                    rank=global_group.rank,
+                    dp_size=tp_group.size,
+                    out_dtype=out_dtype,
+                )
+            )
+            torch.testing.assert_close(
+                metadata_ref_out_tokens_interleaved,
+                local_expert_ref_out_tokens,
+            )
+            ll_out_tokens_interleaved = torch.empty_like(out_tokens)
+            _ll_combine_handle_interleaved, ll_combine_recv_interleaved = (
+                all_to_all.low_latency_combine(
+                    ll_expert_y_interleaved,
+                    ll_dispatch_handle_interleaved,
+                    out=ll_out_tokens_interleaved,
+                    bound_m=local_rank.bound_m,
+                )
+            )
+            ll_combine_recv_interleaved()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(ll_out_tokens_interleaved, ref_out_tokens)
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
+
+            (
+                _ll_expert_x_reuse,
+                _ll_expert_x_scale_reuse,
+                _ll_expert_num_tokens_reuse,
+                ll_dispatch_handle_reuse,
+                ll_dispatch_recv_reuse,
+            ) = all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
+            )
+            assert ll_dispatch_handle_reuse._slot == 0
+            assert _ll_expert_x_reuse.data_ptr() == ll_expert_x.data_ptr()
+            if ll_expert_x_scale is None:
+                assert _ll_expert_x_scale_reuse is None
+            else:
+                assert _ll_expert_x_scale_reuse is not None
+                assert (
+                    _ll_expert_x_scale_reuse.data_ptr()
+                    == ll_expert_x_scale.data_ptr()
+                )
+            if ll_expert_x.dtype == out_dtype:
+                ll_combine_buffer_reuse = (
+                    all_to_all.get_next_low_latency_combine_buffer(
+                        ll_dispatch_handle_reuse
+                    )
+                )
+                assert ll_combine_buffer_reuse.data_ptr() == ll_expert_x.data_ptr()
+            ll_dispatch_recv_reuse()
+            _ll_combine_handle_reuse, ll_combine_recv_reuse = (
+                all_to_all.low_latency_combine(
+                    ll_expert_y,
+                    ll_dispatch_handle_reuse,
+                    out=ll_out_tokens,
+                    bound_m=local_rank.bound_m,
+                )
+            )
+            ll_combine_recv_reuse()
+            torch.cuda.synchronize()
+
+            with pytest.raises(RuntimeError, match="stale or invalid"):
+                all_to_all.low_latency_combine(
+                    ll_expert_y,
+                    ll_dispatch_handle,
+                    out=ll_out_tokens,
+                    bound_m=local_rank.bound_m,
+                )
     except Exception:
         logger.exception("All-to-all failed")
         raise
@@ -236,6 +632,8 @@ def _test_p2p_all_to_all_worker(
 
 @mark_fabric
 @mark_kernel
+@mark_cuda
+@mark_distributed
 @gpu_only
 @pytest.mark.parametrize(
     "config",
@@ -262,6 +660,30 @@ def _test_p2p_all_to_all_worker(
                 pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
             ],
             id="TP2-NIC1-FP32",
+        ),
+        pytest.param(
+            _Config(
+                world_size=2,
+                dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=128,
+                num_experts=16,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                num_experts_per_token=2,
+                max_private_tokens=None,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=None,
+                max_tokens_per_expert=256,
+            ),
+            marks=[
+                mark_ci_2gpu,
+                pytest.mark.skipif(not has_tp(2), reason="Requires 2 devices"),
+            ],
+            id="TP2-NIC1-FP32-BATCHED",
         ),
         pytest.param(
             _Config(
@@ -365,6 +787,7 @@ def _test_p2p_all_to_all_worker(
                 hidden_dim=128,
                 hidden_dim_scale=16,
                 max_private_tokens=None,
+                max_tokens_per_expert=4,
                 num_experts_per_token=2,
                 in_dtype=torch.bfloat16,
                 out_dtype=torch.bfloat16,
@@ -405,6 +828,30 @@ def _test_p2p_all_to_all_worker(
             _Config(
                 world_size=4,
                 dp_size=1,
+                nets_per_gpu=1,
+                max_num_tokens=64,
+                num_experts=64,
+                hidden_dim=128,
+                hidden_dim_scale=None,
+                max_private_tokens=None,
+                num_experts_per_token=4,
+                in_dtype=torch.float32,
+                out_dtype=torch.float32,
+                scale_dtype=None,
+                expert_padding=1,
+                nvlink_group=4,
+                max_tokens_per_expert=128,
+            ),
+            marks=[
+                mark_ci_4gpu,
+                pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
+            ],
+            id="TP4-NIC1-FP32-BATCHED-NVL4",
+        ),
+        pytest.param(
+            _Config(
+                world_size=4,
+                dp_size=1,
                 nets_per_gpu=2,
                 max_num_tokens=128,
                 num_experts=256,
@@ -430,9 +877,9 @@ def _test_p2p_all_to_all_worker(
                 world_size=4,
                 dp_size=2,
                 nets_per_gpu=1,
-                max_num_tokens=1,
-                num_experts=4,
-                hidden_dim=8,
+                max_num_tokens=128,
+                num_experts=128,
+                hidden_dim=128,
                 hidden_dim_scale=None,
                 max_private_tokens=None,
                 num_experts_per_token=1,
@@ -446,7 +893,7 @@ def _test_p2p_all_to_all_worker(
                 mark_ci_4gpu,
                 pytest.mark.skipif(not has_tp(4), reason="Requires 4 devices"),
             ],
-            id="TP4-DP2-NIC1-BF16",
+            id="TP4-DP2-NIC1-BF16-TP-LANE-COLLISIONS",
         ),
         pytest.param(
             _Config(

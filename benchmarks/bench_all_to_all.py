@@ -19,6 +19,18 @@ from tests.p2p_all_to_all.data import RankTestData
 logger = logging_utils.get_logger("bench_all_to_all")
 
 
+def optional_int(value: str) -> Optional[int]:
+    if value.lower() in ("none", "null"):
+        return None
+    return int(value)
+
+
+def optional_dtype(value: str) -> Optional[torch.dtype]:
+    if value.lower() in ("none", "null"):
+        return None
+    return str_to_dtype(value)
+
+
 def rand_topk_idx(
     num_tokens: int,
     num_experts: int,
@@ -58,9 +70,11 @@ def make_rng(device: torch.device, rank: int) -> torch.Generator:
 
 @dataclass(slots=True)
 class AllToAllConfig:
+    api: str
     nets_per_gpu: int
     max_num_tokens: int
-    max_private_tokens: int
+    max_tokens_per_expert: Optional[int]
+    max_private_tokens: Optional[int]
     num_experts: int
     hidden_dim: int
     hidden_dim_scale: Optional[int]
@@ -104,6 +118,9 @@ class AllToAllResource:
             cfg.num_experts // global_group.size
         )
         self.num_tokens = num_tokens = num_dp_groups * cfg.max_num_tokens
+        self.ll_max_tokens_per_expert = cfg.max_tokens_per_expert
+        if self.ll_max_tokens_per_expert is None and cfg.api == "low-latency":
+            self.ll_max_tokens_per_expert = num_tokens
         max_recv_tokens = round_up(
             max(
                 min(
@@ -138,6 +155,7 @@ class AllToAllResource:
             dp_group=dp_group,
             node_group=node_group,
             global_group=global_group,
+            max_tokens_per_expert=self.ll_max_tokens_per_expert,
         )
 
         # Allocate buffers.
@@ -161,6 +179,17 @@ class AllToAllResource:
             dtype=cfg.out_dtype,
             device=device,
         )
+        self.ll_expert_y: torch.Tensor | None = None
+        if self.ll_max_tokens_per_expert is not None:
+            self.ll_expert_y = torch.empty(
+                (
+                    num_local_experts,
+                    self.ll_max_tokens_per_expert,
+                    cfg.hidden_dim,
+                ),
+                dtype=cfg.out_dtype,
+                device=device,
+            )
         self.out_expert_x_scale: torch.Tensor | None = None
         if cfg.hidden_dim_scale is not None or cfg.scale_dtype is not None:
             assert cfg.scale_dtype is not None
@@ -185,6 +214,83 @@ class AllToAllResource:
         )
 
 
+def _byte_counter_is_empty(perf_stats: list[dict]) -> bool:
+    byte_fields = (
+        "local_dispatch_bytes",
+        "nvlink_dispatch_bytes",
+        "network_dispatch_bytes",
+        "local_combine_bytes",
+        "nvlink_combine_bytes",
+        "network_combine_bytes",
+    )
+    return all(sum(int(s.get(field, 0)) for s in perf_stats) == 0 for field in byte_fields)
+
+
+def _replay_single_node_route_byte_stats(
+    r: AllToAllResource,
+    num_iters: int,
+) -> list[dict]:
+    """Replay benchmark routes for telemetry without touching the measured path."""
+    world_size = r.global_group.size
+    experts_per_rank = r.cfg.num_experts // world_size
+    dispatch_token_bytes = r.cfg.dispatch_bytes // (
+        r.cfg.max_num_tokens * r.cfg.num_experts_per_token
+    )
+    combine_token_bytes = r.cfg.combine_bytes // (
+        r.cfg.max_num_tokens * r.cfg.num_experts_per_token
+    )
+
+    dispatch_peer_tokens = [[0 for _ in range(world_size)] for _ in range(world_size)]
+    for src_rank in range(world_size):
+        rng = make_rng(r.device, src_rank)
+        for _ in range(num_iters):
+            topk_idx = rand_topk_idx(
+                r.cfg.max_num_tokens,
+                r.cfg.num_experts,
+                r.cfg.num_experts_per_token,
+                rng,
+                r.device,
+            )
+            dst_ranks = torch.div(
+                topk_idx.to(torch.int64),
+                experts_per_rank,
+                rounding_mode="floor",
+            )
+            counts = torch.bincount(
+                dst_ranks.reshape(-1),
+                minlength=world_size,
+            ).to("cpu")
+            for dst_rank, count in enumerate(counts.tolist()):
+                dispatch_peer_tokens[src_rank][dst_rank] += int(count)
+
+    stats: list[dict] = []
+    for rank in range(world_size):
+        peer_dispatch_bytes = [
+            tokens * dispatch_token_bytes for tokens in dispatch_peer_tokens[rank]
+        ]
+        peer_combine_bytes = [
+            dispatch_peer_tokens[src_rank][rank] * combine_token_bytes
+            for src_rank in range(world_size)
+        ]
+
+        local_dispatch = peer_dispatch_bytes[rank]
+        local_combine = peer_combine_bytes[rank]
+        nvlink_dispatch = sum(peer_dispatch_bytes) - local_dispatch
+        nvlink_combine = sum(peer_combine_bytes) - local_combine
+        stats.append(
+            {
+                "local_dispatch_bytes": local_dispatch,
+                "nvlink_dispatch_bytes": nvlink_dispatch,
+                "network_dispatch_bytes": 0,
+                "local_combine_bytes": local_combine,
+                "nvlink_combine_bytes": nvlink_combine,
+                "network_combine_bytes": 0,
+                "peer_dispatch_bytes": peer_dispatch_bytes,
+                "peer_combine_bytes": peer_combine_bytes,
+            }
+        )
+    return stats
+
 def correctness_check(r: AllToAllResource) -> None:
     expected_num_tokens_list = [
         RankTestData.rand_indices_and_count(
@@ -206,23 +312,62 @@ def correctness_check(r: AllToAllResource) -> None:
     ref_out_tokens = act(local_rank.dp_x, local_rank.dp_x_scale).to(r.cfg.out_dtype)
 
     # Test run.
-    r.all_to_all.dispatch(
-        out_expert_num_tokens=r.expert_num_tokens,
-        out_expert_x=r.out_expert_x,
-        out_expert_x_scale=r.out_expert_x_scale,
-        dp_x=local_rank.dp_x,
-        dp_x_scale=local_rank.dp_x_scale,
-        indices=local_rank.indices,
-        weights=local_rank.weights,
-    )
-    expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
-    r.all_to_all.combine(
-        out_tokens=r.out_tokens,
-        indices=local_rank.indices,
-        weights=local_rank.weights,
-        expert_y=expert_y,
-        bound_m=local_rank.bound_m,
-    )
+    if r.cfg.api == "low-latency":
+        (
+            expert_x,
+            expert_x_scale,
+            expert_num_tokens,
+            dispatch_handle,
+            dispatch_recv,
+        ) = r.all_to_all.low_latency_dispatch(
+            local_rank.dp_x,
+            local_rank.indices,
+            local_rank.weights,
+            local_rank.dp_x_scale,
+            slot_key=0,
+        )
+        dispatch_recv()
+        expert_y = act(
+            expert_x.reshape(-1, r.cfg.hidden_dim),
+            (
+                None
+                if expert_x_scale is None
+                else expert_x_scale.reshape(-1, r.cfg.hidden_dim_scale)
+            ),
+        ).to(r.cfg.out_dtype)
+        expert_y = expert_y.reshape_as(expert_x).to(r.cfg.out_dtype)
+        _combine_handle, combine_recv = r.all_to_all.low_latency_combine(
+            expert_y,
+            dispatch_handle,
+            out=r.out_tokens,
+            bound_m=local_rank.bound_m,
+        )
+        combine_recv()
+        r.expert_num_tokens.copy_(expert_num_tokens)
+        r.out_expert_x = expert_x.reshape(-1, r.cfg.hidden_dim)
+        r.out_expert_x_scale = (
+            None
+            if expert_x_scale is None
+            else expert_x_scale.reshape(-1, r.cfg.hidden_dim_scale)
+        )
+    else:
+        r.all_to_all.dispatch(
+            out_expert_num_tokens=r.expert_num_tokens,
+            out_expert_x=r.out_expert_x,
+            out_expert_x_scale=r.out_expert_x_scale,
+            dp_x=local_rank.dp_x,
+            dp_x_scale=local_rank.dp_x_scale,
+            indices=local_rank.indices,
+            weights=local_rank.weights,
+        )
+        expert_y = act(r.out_expert_x, r.out_expert_x_scale).to(r.cfg.out_dtype)
+        r.all_to_all.combine(
+            out_tokens=r.out_tokens,
+            indices=local_rank.indices,
+            weights=local_rank.weights,
+            expert_y=expert_y,
+            bound_m=local_rank.bound_m,
+        )
     torch.cuda.synchronize()
 
     # Verify the token counts.
@@ -236,12 +381,22 @@ def correctness_check(r: AllToAllResource) -> None:
         return ",".join(f"{v:.2f}" for v in x.tolist())
 
     tokens_on_rank = set()
-    index = 0
-    for n in expected_local_tokens.tolist():
-        for token in r.out_expert_x[index : index + n]:
-            tokens_on_rank.add(hash_token(token))
+    if r.cfg.api == "low-latency":
+        assert r.ll_max_tokens_per_expert is not None
+        starts = [
+            local_expert * r.ll_max_tokens_per_expert
+            for local_expert in range(r.num_local_experts)
+        ]
+    else:
+        starts = []
+        index = 0
+        for n in expected_local_tokens.tolist():
+            starts.append(index)
+            index = round_up(index + n, r.expert_padding)
 
-        index = round_up(index + n, r.expert_padding)
+    for start, n in zip(starts, expected_local_tokens.tolist()):
+        for token in r.out_expert_x[start : start + n]:
+            tokens_on_rank.add(hash_token(token))
 
     # Verify the tokens on the rank.
     num_missing = 0
@@ -267,119 +422,92 @@ def correctness_check(r: AllToAllResource) -> None:
 
 
 def benchmark(
-    r: AllToAllResource, num_warmup: int, num_repeats: int, output: Path
+    r: AllToAllResource, num_warmup: int, num_repeats: int, output: Path, verbose: bool = False
 ) -> None:
+    logger.info("Starting benchmark setup")
     local_rank = r.create_rank_data(r.dp_rank)
     rng = make_rng(r.device, r.dp_rank)
-    out_dummy = torch.empty((1,), dtype=torch.float32, device=r.device)
-    gemm = torch.empty(
-        (2048, 2048) if r.cfg.max_num_tokens <= 128 else (8192, 8192),
-        dtype=torch.float32,
-        device=r.device,
-    )
 
-    def wait() -> None:
-        # Wait to simulate the delay of other layers.
-        torch.distributed.all_reduce(out_dummy)
-        _ = gemm @ gemm
-        torch.distributed.all_reduce(out_dummy)
-
-    def dispatch(do_send: bool, do_recv: bool) -> None:
-        r.all_to_all.dispatch(
-            out_expert_num_tokens=r.expert_num_tokens,
-            out_expert_x=r.out_expert_x,
-            out_expert_x_scale=r.out_expert_x_scale,
-            dp_x=local_rank.dp_x,
-            dp_x_scale=local_rank.dp_x_scale,
-            indices=local_rank.indices,
-            weights=local_rank.weights,
-            bound_m=local_rank.bound_m,
-            do_send=do_send,
-            do_recv=do_recv,
-        )
-
-    def combine(do_send: bool, do_recv: bool) -> None:
-        r.all_to_all.combine(
-            out_tokens=r.out_tokens,
-            indices=local_rank.indices,
-            weights=local_rank.weights,
-            expert_y=r.expert_y,
-            bound_m=local_rank.bound_m,
-            do_send=do_send,
-            do_recv=do_recv,
-        )
-
-    # Create and initialize events for timing.
-    events = []
-    for _ in range(num_warmup + num_repeats):
-        dispatch_start = torch.cuda.Event(enable_timing=True)
-        dispatch_end = torch.cuda.Event(enable_timing=True)
-        combine_start = torch.cuda.Event(enable_timing=True)
-        combine_end = torch.cuda.Event(enable_timing=True)
-        dispatch_send_start = torch.cuda.Event(enable_timing=True)
-        dispatch_send_end = torch.cuda.Event(enable_timing=True)
-        dispatch_recv_start = torch.cuda.Event(enable_timing=True)
-        dispatch_recv_end = torch.cuda.Event(enable_timing=True)
-        combine_send_start = torch.cuda.Event(enable_timing=True)
-        combine_send_end = torch.cuda.Event(enable_timing=True)
-        combine_recv_start = torch.cuda.Event(enable_timing=True)
-        combine_recv_end = torch.cuda.Event(enable_timing=True)
-        dispatch_start.record()
-        dispatch_end.record()
-        combine_start.record()
-        combine_end.record()
-        dispatch_send_start.record()
-        dispatch_send_end.record()
-        dispatch_recv_start.record()
-        dispatch_recv_end.record()
-        combine_send_start.record()
-        combine_send_end.record()
-        combine_recv_start.record()
-        combine_recv_end.record()
-        events.append(
+    def dispatch() -> None:
+        nonlocal dispatch_handle
+        if r.cfg.api == "low-latency":
             (
-                dispatch_start,
-                dispatch_end,
-                combine_start,
-                combine_end,
-                dispatch_send_start,
-                dispatch_send_end,
-                dispatch_recv_start,
-                dispatch_recv_end,
-                combine_send_start,
-                combine_send_end,
-                combine_recv_start,
-                combine_recv_end,
+                _expert_x,
+                _expert_x_scale,
+                _expert_num_tokens,
+                dispatch_handle,
+                recv,
+            ) = r.all_to_all.low_latency_dispatch(
+                local_rank.dp_x,
+                local_rank.indices,
+                local_rank.weights,
+                local_rank.dp_x_scale,
+                slot_key=0,
             )
-        )
+            recv()
+        else:
+            r.all_to_all.dispatch(
+                out_expert_num_tokens=r.expert_num_tokens,
+                out_expert_x=r.out_expert_x,
+                out_expert_x_scale=r.out_expert_x_scale,
+                dp_x=local_rank.dp_x,
+                dp_x_scale=local_rank.dp_x_scale,
+                indices=local_rank.indices,
+                weights=local_rank.weights,
+                bound_m=local_rank.bound_m,
+                do_send=True,
+                do_recv=True,
+            )
 
-    # Benchmark loop
+    def combine() -> None:
+        nonlocal dispatch_handle
+        if r.cfg.api == "low-latency":
+            assert dispatch_handle is not None
+            assert r.ll_expert_y is not None
+            _combine_handle, recv = r.all_to_all.low_latency_combine(
+                r.ll_expert_y,
+                dispatch_handle,
+                out=r.out_tokens,
+                bound_m=local_rank.bound_m,
+            )
+            recv()
+            dispatch_handle = None
+        else:
+            r.all_to_all.combine(
+                out_tokens=r.out_tokens,
+                indices=local_rank.indices,
+                weights=local_rank.weights,
+                expert_y=r.expert_y,
+                bound_m=local_rank.bound_m,
+                do_send=True,
+                do_recv=True,
+            )
+
+    dispatch_handle = None
+
+    # Combined Benchmark Events
+    dispatch_events = []
+    combine_events = []
+    for _ in range(num_warmup + num_repeats):
+        d_start = torch.cuda.Event(enable_timing=True)
+        d_end = torch.cuda.Event(enable_timing=True)
+        dispatch_events.append((d_start, d_end))
+
+        c_start = torch.cuda.Event(enable_timing=True)
+        c_end = torch.cuda.Event(enable_timing=True)
+        combine_events.append((c_start, c_end))
+
+    logger.info("[Rank %d] Starting lockstep warmup (%d iterations)", r.global_group.rank, num_warmup)
     last_report_time = time.time()
     for i in range(num_warmup + num_repeats):
-        if i + 1 == num_warmup:
-            # Start profiling one iteration before the bench starts.
+        if i == num_warmup:
+            if r.global_group.rank == 0:
+                logger.info("Completed warmup. Starting benchmark (%d iterations)", num_repeats)
             torch.cuda.profiler.start()
-        now = time.time()
-        if now - last_report_time > 1 or i + 1 == num_warmup + num_repeats:
-            logger.info("Iteration %i/%i", i + 1, num_warmup + num_repeats)
-            last_report_time = now
-
-        (
-            dispatch_start,
-            dispatch_end,
-            combine_start,
-            combine_end,
-            dispatch_send_start,
-            dispatch_send_end,
-            dispatch_recv_start,
-            dispatch_recv_end,
-            combine_send_start,
-            combine_send_end,
-            combine_recv_start,
-            combine_recv_end,
-        ) = events[i]
 
         # Update indices
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Generating indices...", r.global_group.rank, i + 1)
         local_rank.indices = rand_topk_idx(
             r.cfg.max_num_tokens,
             r.cfg.num_experts,
@@ -388,131 +516,248 @@ def benchmark(
             r.device,
         )
 
-        # Send-Recv back to back
-        with profile_range("back-to-back"):
-            wait()
+        # Time Dispatch
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Starting dispatch...", r.global_group.rank, i + 1)
+        d_start, d_end = dispatch_events[i]
+        d_start.record()
+        dispatch()
+        d_end.record()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Dispatch completed", r.global_group.rank, i + 1)
 
-            dispatch_start.record()
-            dispatch(do_send=True, do_recv=True)
-            dispatch_end.record()
+        # Time Combine
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Starting combine...", r.global_group.rank, i + 1)
+        c_start, c_end = combine_events[i]
+        c_start.record()
+        combine()
+        c_end.record()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Combine completed", r.global_group.rank, i + 1)
 
-            wait()
+        if verbose:
+            logger.info("[Rank %d] Iteration %d - Synchronizing CUDA...", r.global_group.rank, i + 1)
+            torch.cuda.synchronize()
+            logger.info("[Rank %d] Iteration %d - Synchronized successfully", r.global_group.rank, i + 1)
+            logger.info("[Rank %d] Iteration %d - Entering global process group barrier...", r.global_group.rank, i + 1)
+            r.global_group.barrier()
+            logger.info("[Rank %d] Iteration %d - Passed global barrier", r.global_group.rank, i + 1)
+            if (i + 1) % 10 == 0 or i < 5:
+                logger.info("[Rank %d] Iteration %d/%d completed", r.global_group.rank, i + 1, num_warmup + num_repeats)
 
-            combine_start.record()
-            combine(do_send=True, do_recv=True)
-            combine_end.record()
-
-        # Insert long kernel in between send and recv
-        with profile_range("overlap"):
-            wait()
-
-            dispatch_send_start.record()
-            dispatch(do_send=True, do_recv=False)
-            dispatch_send_end.record()
-
-            wait()  # Fake overlap work
-
-            dispatch_recv_start.record()
-            dispatch(do_send=False, do_recv=True)
-            dispatch_recv_end.record()
-
-            wait()
-
-            combine_send_start.record()
-            combine(do_send=True, do_recv=False)
-            combine_send_end.record()
-
-            wait()  # Fake overlap work
-
-            combine_recv_start.record()
-            combine(do_send=False, do_recv=True)
-            combine_recv_end.record()
+        if (i + 1) % 100 == 0 or i + 1 == num_warmup + num_repeats:
+            now = time.time()
+            if now - last_report_time > 1 or i + 1 == num_warmup + num_repeats:
+                if r.global_group.rank == 0:
+                    logger.info("Iteration %i/%i", i + 1, num_warmup + num_repeats)
+                last_report_time = now
 
     torch.cuda.synchronize()
     torch.cuda.profiler.stop()
+    logger.info("[Rank %d] Completed benchmark iterations", r.global_group.rank)
 
     dispatch_times: list[float] = []
-    dispatch_send_times: list[float] = []
-    dispatch_recv_times: list[float] = []
+    for start, end in dispatch_events[num_warmup:]:
+        dispatch_times.append(start.elapsed_time(end) * 1000)
+
     combine_times: list[float] = []
-    combine_send_times: list[float] = []
-    combine_recv_times: list[float] = []
-    for (
-        dispatch_st,
-        dispatch_en,
-        combine_st,
-        combine_en,
-        dispatch_send_st,
-        dispatch_send_en,
-        dispatch_recv_st,
-        dispatch_recv_en,
-        combine_send_st,
-        combine_send_en,
-        combine_recv_st,
-        combine_recv_en,
-    ) in events[num_warmup:]:
-        dispatch_times.append(dispatch_st.elapsed_time(dispatch_en) * 1000)
-        combine_times.append(combine_st.elapsed_time(combine_en) * 1000)
-        dispatch_send_times.append(
-            dispatch_send_st.elapsed_time(dispatch_send_en) * 1000
-        )
-        dispatch_recv_times.append(
-            dispatch_recv_st.elapsed_time(dispatch_recv_en) * 1000
-        )
-        combine_send_times.append(combine_send_st.elapsed_time(combine_send_en) * 1000)
-        combine_recv_times.append(combine_recv_st.elapsed_time(combine_recv_en) * 1000)
+    for start, end in combine_events[num_warmup:]:
+        combine_times.append(start.elapsed_time(end) * 1000)
+
+    # Retrieve performance stats from the library
+    perf_stats = r.all_to_all.get_perf_stats()
 
     # All-gather results from all ranks
     dispatch_times = sum(r.global_group.all_gather_object(dispatch_times), [])
     combine_times = sum(r.global_group.all_gather_object(combine_times), [])
-    dispatch_send_times = sum(r.global_group.all_gather_object(dispatch_send_times), [])
-    dispatch_recv_times = sum(r.global_group.all_gather_object(dispatch_recv_times), [])
-    combine_send_times = sum(r.global_group.all_gather_object(combine_send_times), [])
-    combine_recv_times = sum(r.global_group.all_gather_object(combine_recv_times), [])
+    all_perf_stats = r.global_group.all_gather_object(perf_stats)
 
-    # Report the results.
+    # Report the results
     if r.global_group.rank == 0:
         stat_dispatch = Statistics.create(dispatch_times)
-        stat_dispatch_send = Statistics.create(dispatch_send_times)
-        stat_dispatch_recv = Statistics.create(dispatch_recv_times)
         stat_combine = Statistics.create(combine_times)
-        stat_combine_send = Statistics.create(combine_send_times)
-        stat_combine_recv = Statistics.create(combine_recv_times)
+        byte_accounting = "backend"
+        if (
+            r.cfg.api == "low-latency"
+            and r.cfg.nvlink == r.global_group.size
+            and r.dp_group.size == 1
+            and _byte_counter_is_empty(all_perf_stats)
+        ):
+            replayed_stats = _replay_single_node_route_byte_stats(
+                r,
+                num_warmup + num_repeats,
+            )
+            for stat, replayed in zip(all_perf_stats, replayed_stats):
+                stat.update(replayed)
+            byte_accounting = "benchmark_replayed_routes"
+            logger.info(
+                "Backend byte counters were empty; using replayed benchmark routes for single-node byte accounting."
+            )
 
         dispatch_bandwidth = r.cfg.dispatch_bytes / stat_dispatch.p50 * 1e-3
         combine_bandwidth = r.cfg.combine_bytes / stat_combine.p50 * 1e-3
 
-        logger.info(
-            "Dispatch both time: %s, %.1f GB/s",
-            stat_dispatch,
-            dispatch_bandwidth,
-        )
-        logger.info("Dispatch send time: %s", stat_dispatch_send)
-        logger.info("Dispatch recv time: %s", stat_dispatch_recv)
+        # Aggregate link metrics (sum across all ranks, then compute per-rank averages)
+        num_total_iters = num_warmup + num_repeats
+        total_local_disp = sum(s.get('local_dispatch_bytes', 0) for s in all_perf_stats)
+        total_nvlink_disp = sum(s.get('nvlink_dispatch_bytes', 0) for s in all_perf_stats)
+        total_network_disp = sum(s.get('network_dispatch_bytes', 0) for s in all_perf_stats)
 
-        logger.info(
-            "Combine both time: %s, %.1f GB/s",
-            stat_combine,
-            combine_bandwidth,
-        )
-        logger.info("Combine send time: %s", stat_combine_send)
-        logger.info("Combine recv time: %s", stat_combine_recv)
+        total_local_comb = sum(s.get('local_combine_bytes', 0) for s in all_perf_stats)
+        total_nvlink_comb = sum(s.get('nvlink_combine_bytes', 0) for s in all_perf_stats)
+        total_network_comb = sum(s.get('network_combine_bytes', 0) for s in all_perf_stats)
+
+        # Average per rank per iteration
+        num_ranks = len(all_perf_stats)
+        avg_local_disp_bytes = total_local_disp / num_ranks / num_total_iters
+        avg_nvlink_disp_bytes = total_nvlink_disp / num_ranks / num_total_iters
+        avg_network_disp_bytes = total_network_disp / num_ranks / num_total_iters
+
+        avg_local_comb_bytes = total_local_comb / num_ranks / num_total_iters
+        avg_nvlink_comb_bytes = total_nvlink_comb / num_ranks / num_total_iters
+        avg_network_comb_bytes = total_network_comb / num_ranks / num_total_iters
+
+        # Compute per-link bandwidths using p50 elapsed time
+        nvlink_disp_bandwidth = avg_nvlink_disp_bytes / stat_dispatch.p50 * 1e-3
+        network_disp_bandwidth = avg_network_disp_bytes / stat_dispatch.p50 * 1e-3
+
+        nvlink_comb_bandwidth = avg_nvlink_comb_bytes / stat_combine.p50 * 1e-3
+        network_comb_bandwidth = avg_network_comb_bytes / stat_combine.p50 * 1e-3
+
+        logger.info("============================================================")
+        logger.info("P2P All-to-All Link Performance Report")
+        logger.info("API: %s", r.cfg.api)
+        logger.info("============================================================")
+        logger.info("Dispatch time: %s, %.1f GB/s", stat_dispatch, dispatch_bandwidth)
+        logger.info("  - Local Loopback:  %6.2f MB (%5.1f%%)", avg_local_disp_bytes / 1e6, avg_local_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0)
+        logger.info("  - NVLink:          %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_nvlink_disp_bytes / 1e6, avg_nvlink_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0, nvlink_disp_bandwidth)
+        logger.info("  - Network (RDMA):  %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_network_disp_bytes / 1e6, avg_network_disp_bytes / r.cfg.dispatch_bytes * 100 if r.cfg.dispatch_bytes else 0, network_disp_bandwidth)
+        logger.info("------------------------------------------------------------")
+        logger.info("Combine time: %s, %.1f GB/s", stat_combine, combine_bandwidth)
+        logger.info("  - Local Loopback:  %6.2f MB (%5.1f%%)", avg_local_comb_bytes / 1e6, avg_local_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0)
+        logger.info("  - NVLink:          %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_nvlink_comb_bytes / 1e6, avg_nvlink_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0, nvlink_comb_bandwidth)
+        logger.info("  - Network (RDMA):  %6.2f MB (%5.1f%%) -> %6.1f GB/s", avg_network_comb_bytes / 1e6, avg_network_comb_bytes / r.cfg.combine_bytes * 100 if r.cfg.combine_bytes else 0, network_comb_bandwidth)
+        logger.info("============================================================")
+
+        phase_counter_names = [
+            ("wait_dispatch_route_ns", "wait dispatch route"),
+            ("wait_dispatch_send_ns", "wait dispatch send"),
+            ("route_exchange_ns", "wait route exchange"),
+            ("process_routing_ns", "process routing"),
+            ("dispatch_transfer_wait_ns", "wait dispatch transfer"),
+            ("wait_dispatch_recv_ns", "wait dispatch recv"),
+            ("dispatch_barrier_ns", "dispatch barrier"),
+            ("wait_combine_send_ns", "wait combine send"),
+            ("combine_transfer_wait_ns", "wait combine transfer"),
+            ("wait_combine_recv_ns", "wait combine recv"),
+            ("combine_barrier_ns", "combine barrier"),
+        ]
+        logger.info("Worker phase timings (average ms per rank per iteration):")
+        for key, label in phase_counter_names:
+            total_ns = sum(s.get(key, 0) for s in all_perf_stats)
+            avg_ms = total_ns / num_ranks / num_total_iters / 1e6
+            logger.info("  - %-23s %8.3f ms", label + ":", avg_ms)
+        logger.info("============================================================")
+
+        # Let's print the per-rank breakdown to show detailed routing patterns
+        logger.info("Per-Rank Link Data Volume Breakdown (Average per iteration):")
+        for r_id, s in enumerate(all_perf_stats):
+            disp_local = s.get('local_dispatch_bytes', 0) / num_total_iters
+            disp_nvl = s.get('nvlink_dispatch_bytes', 0) / num_total_iters
+            disp_net = s.get('network_dispatch_bytes', 0) / num_total_iters
+            disp_total = disp_local + disp_nvl + disp_net
+
+            comb_local = s.get('local_combine_bytes', 0) / num_total_iters
+            comb_nvl = s.get('nvlink_combine_bytes', 0) / num_total_iters
+            comb_net = s.get('network_combine_bytes', 0) / num_total_iters
+            comb_total = comb_local + comb_nvl + comb_net
+
+            logger.info(
+                "  Rank %d: Dispatch [Local: %5.1f%%, NVLink: %5.1f%%, Network: %5.1f%%] | Combine [Local: %5.1f%%, NVLink: %5.1f%%, Network: %5.1f%%]",
+                r_id,
+                disp_local / disp_total * 100 if disp_total else 0,
+                disp_nvl / disp_total * 100 if disp_total else 0,
+                disp_net / disp_total * 100 if disp_total else 0,
+                comb_local / comb_total * 100 if comb_total else 0,
+                comb_nvl / comb_total * 100 if comb_total else 0,
+                comb_net / comb_total * 100 if comb_total else 0,
+            )
+        logger.info("============================================================")
+
+        # Print the P2P traffic matrix (bytes sent per rank pair)
+        logger.info("Peer-to-Peer Dispatch Traffic Matrix (Average MB sent from Rank -> Rank per iteration):")
+        header_cols = [f"To R{i}" for i in range(num_ranks)]
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_disp = s.get('peer_dispatch_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                val = peer_disp[target_rank] if target_rank < len(peer_disp) else 0
+                val_mb = val / num_total_iters / 1e6
+                row_cols.append(f"{val_mb:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("------------------------------------------------------------")
+
+        logger.info("Peer-to-Peer Combine Traffic Matrix (Average MB gathered from Rank -> Rank per iteration):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_comb = s.get('peer_combine_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                val = peer_comb[target_rank] if target_rank < len(peer_comb) else 0
+                val_mb = val / num_total_iters / 1e6
+                row_cols.append(f"{val_mb:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("============================================================")
+
+        # Print the P2P bandwidth matrix (GB/s per rank pair)
+        logger.info("Peer-to-Peer Dispatch Bandwidth Matrix (GB/s per link, self=x):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_disp = s.get('peer_dispatch_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                if target_rank == r_id:
+                    row_cols.append(f"{'x':>8}")
+                else:
+                    val = peer_disp[target_rank] if target_rank < len(peer_disp) else 0
+                    val_avg_bytes = val / num_total_iters
+                    val_gb_s = val_avg_bytes / stat_dispatch.p50 * 1e-3
+                    row_cols.append(f"{val_gb_s:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("------------------------------------------------------------")
+
+        logger.info("Peer-to-Peer Combine Bandwidth Matrix (GB/s per link, self=x):")
+        logger.info("  From  | " + " | ".join(f"{col:>8}" for col in header_cols))
+        logger.info("  " + "-" * (8 + num_ranks * 11))
+        for r_id, s in enumerate(all_perf_stats):
+            peer_comb = s.get('peer_combine_bytes', [0] * num_ranks)
+            row_cols = []
+            for target_rank in range(num_ranks):
+                if target_rank == r_id:
+                    row_cols.append(f"{'x':>8}")
+                else:
+                    val = peer_comb[target_rank] if target_rank < len(peer_comb) else 0
+                    val_avg_bytes = val / num_total_iters
+                    val_gb_s = val_avg_bytes / stat_combine.p50 * 1e-3
+                    row_cols.append(f"{val_gb_s:8.2f}")
+            logger.info(f"  Rank {r_id:2d} | " + " | ".join(row_cols))
+        logger.info("============================================================")
 
         data = {
-            "dispatch": {
-                "both": asdict(stat_dispatch),
-                "send": asdict(stat_dispatch_send),
-                "recv": asdict(stat_dispatch_recv),
-            },
-            "combine": {
-                "both": asdict(stat_combine),
-                "send": asdict(stat_combine_send),
-                "recv": asdict(stat_combine_recv),
-            },
+            "dispatch": asdict(stat_dispatch),
+            "combine": asdict(stat_combine),
+            "byte_accounting": byte_accounting,
+            "perf_stats": all_perf_stats,
         }
 
-        with output.open("w") as f:
-            f.write(json.dumps(data))
+        if str(output) != "/dev/stdout":
+            with output.open("w") as f:
+                f.write(json.dumps(data, indent=2))
 
 
 def _worker(
@@ -524,14 +769,18 @@ def _worker(
     num_repeats: int,
     output: Path,
     check: bool,
+    verbose: bool = False,
 ) -> None:
     """Benchmark worker process."""
 
     assert dp_group is not None
     assert global_group is not None
 
-    if global_group.rank == 0:
-        logging_utils.setup(level="INFO")
+    logging_utils.setup(level="INFO")
+
+    import os
+    env_verbose = "PPLX_GARDEN_DEBUG" in os.environ or "PPLX_DEBUG" in os.environ
+    verbose = verbose or env_verbose
 
     r = AllToAllResource(device, dp_group, global_group, config)
 
@@ -557,7 +806,7 @@ def _worker(
             logger.info("Skipping correctness check")
 
         # Benchmark.
-        benchmark(r, num_warmup, num_repeats, output)
+        benchmark(r, num_warmup, num_repeats, output, verbose=verbose)
     finally:
         global_group.barrier()
         r.all_to_all.destroy()
@@ -577,26 +826,38 @@ def main() -> None:
     parser.add_argument("--node-rank", type=int, default=0)
     parser.add_argument("--num-warmup", type=int, default=10000)
     parser.add_argument("--num-repeats", type=int, default=10000)
+    parser.add_argument(
+        "--api",
+        choices=("legacy", "low-latency"),
+        default="legacy",
+        help="API surface to benchmark",
+    )
     parser.add_argument("--nets-per-gpu", type=int, default=2)
     parser.add_argument("--max-num-tokens", type=int, default=128)
-    parser.add_argument("--max-private-tokens", type=int, default=256)
+    parser.add_argument("--max-tokens-per-expert", type=optional_int, default=None)
+    parser.add_argument("--max-private-tokens", type=optional_int, default=256)
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=7168)
-    parser.add_argument("--hidden-dim-scale", type=int, default=56)
+    parser.add_argument("--hidden-dim-scale", type=optional_int, default=56)
     parser.add_argument("--num-experts-per-token", type=int, default=8)
     parser.add_argument("--in-dtype", type=str_to_dtype, default=torch.float8_e4m3fn)
     parser.add_argument("--out-dtype", type=str_to_dtype, default=torch.bfloat16)
-    parser.add_argument("--scale-dtype", type=str_to_dtype, default=torch.float32)
+    parser.add_argument("--scale-dtype", type=optional_dtype, default=torch.float32)
     parser.add_argument("--nvlink", type=int, default=None)
     parser.add_argument("--output", type=Path, default=Path("/dev/stdout"))
     parser.add_argument(
         "--check", type=bool, default=True, action=argparse.BooleanOptionalAction
     )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Enable verbose logging and syncs"
+    )
     args = parser.parse_args()
 
     config = AllToAllConfig(
+        api=args.api,
         nets_per_gpu=args.nets_per_gpu,
         max_num_tokens=args.max_num_tokens,
+        max_tokens_per_expert=args.max_tokens_per_expert,
         max_private_tokens=args.max_private_tokens,
         num_experts=args.num_experts,
         hidden_dim=args.hidden_dim,
@@ -620,8 +881,10 @@ def main() -> None:
         args.num_repeats,
         args.output,
         args.check,
+        args.verbose,
     )
 
 
 if __name__ == "__main__":
+    logger.info("Launching benchmark script")
     main()

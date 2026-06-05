@@ -17,6 +17,19 @@ using namespace rose;
 using namespace rose::device;
 
 
+__global__ __launch_bounds__(WARP_SIZE, 1) void a2a_wait_tx_ready_kernel(
+    uint8_t * __restrict__ tx_ready,
+    const uint32_t * __restrict__ num_recv_tokens_ptr
+) {
+    if (threadIdx.x == 0) {
+        const unsigned num_efa_tokens = __ldg(num_recv_tokens_ptr + 1);
+        if (num_efa_tokens != 0) {
+            while (ld_mmio_b8(tx_ready) == 0);
+        }
+    }
+}
+
+
 template <unsigned NUM_WARPS, unsigned NODE_SIZE, unsigned DP_SIZE, typename TokenDim>
 __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_kernel(
     const size_t token_dim,
@@ -26,15 +39,16 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     uint8_t * __restrict__ tx_ready,
     std::byte * __restrict__ send_buffer,
     std::byte * __restrict__ recv_buffer,
-    uint32_t * __restrict__ source_rank,
+    uint32_t * __restrict__ source_rank_by_final_index,
     uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
     const uint32_t * __restrict__ num_recv_tokens_ptr,
-    uint8_t * __restrict__ combine_send_done,
+    uint32_t * __restrict__ combine_send_done,
     uint32_t * __restrict__ token_counter,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
-    std::byte **recv_ptrs
+    std::byte **recv_ptrs,
+    uint32_t * __restrict__ current_epoch
 ) {
     TokenDim token_bound(token_dim);
     constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
@@ -48,20 +62,26 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     __shared__ Stage shared_stages[NUM_STAGES];
     Stage local_stages[NUM_STAGES];
 
-    // Local copy of peer recv ptrs.
+    // Local copy of peer recv ptrs. The pointer table is only populated when
+    // an intra-node peer group exists; with NODE_SIZE == 1, local writes target
+    // this rank's own recv buffer directly.
     std::byte *recv_ptrs_local[NODE_SIZE];
-    #pragma unroll
-    for (unsigned i = 0; i < NODE_SIZE; i++) {
-        recv_ptrs_local[i] = recv_ptrs[i];
+    if constexpr (NODE_SIZE > 1) {
+        #pragma unroll
+        for (unsigned i = 0; i < NODE_SIZE; i++) {
+            recv_ptrs_local[i] = recv_ptrs[i];
+        }
     }
 
     auto grid = cooperative_groups::this_grid();
     const unsigned rank_node = rank / NODE_SIZE;
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
 
     const unsigned num_recv_tokens = __ldg(num_recv_tokens_ptr);
     const unsigned num_efa_tokens = __ldg(num_recv_tokens_ptr + 1);
+    const bool use_metadata_direct_combine = DP_SIZE == 1 && NODE_SIZE > 1 && num_efa_tokens == 0;
 
     // Pick a token to send.
     unsigned token = blockIdx.x;
@@ -69,31 +89,80 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
     // Synchronization counter.
     auto counter = *sync_counter;
 
-    // Wait for all transactions using the send buffer to finish before writing to it.
+    // Wait for all transactions using the send buffer to finish before writing
+    // to it. Local-node combine copies do not touch the send buffer, so do not
+    // block on tx_ready unless there is fabric-bound combine payload.
     if (warp_id == 0) {
         if (elect_one_sync()) {
-            while (ld_mmio_b8(tx_ready) == 0);
-            if (num_efa_tokens == 0) {
-                st_mmio_b8(combine_send_done, 1);
+            if (num_efa_tokens != 0) {
+                while (ld_mmio_b8(tx_ready) == 0);
             }
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
             auto local_rank = rank % NODE_SIZE;
             if (lane_id < NODE_SIZE) {
-                auto *flag = &sync_ptrs[lane_id][local_rank];
+                auto *flag = &sync_ptrs[local_rank][lane_id];
                 while (ld_volatile_u32(flag) != counter);
             }
         }
     } else if (warp_id == 2) {
         unsigned next_token = token + lane_id * gridDim.x;
         if (next_token < num_recv_tokens && lane_id < NUM_STAGES) {
+            auto index = padded_index[next_token];
             shared_stages[lane_id].offset = combine_send_offset[next_token];
-            shared_stages[lane_id].index = padded_index[next_token];
-            shared_stages[lane_id].rank = source_rank[next_token];
+            shared_stages[lane_id].index = index;
+            shared_stages[lane_id].rank = source_rank_by_final_index[index];
         }
     }
     __syncthreads();
+
+    if (use_metadata_direct_combine) {
+        token = blockIdx.x;
+        while (token < num_recv_tokens) {
+            const uint32_t final_index = padded_index[token];
+            const uint32_t token_rank = source_rank_by_final_index[final_index];
+            const uint32_t offset = combine_send_offset[token];
+            const uint32_t token_peer = token_rank % NODE_SIZE;
+
+            auto *x_token_src = (uint4*)(expert_x_ptr + expert_x_stride * final_index);
+            std::byte *dst_base;
+            if (token_peer == (rank % NODE_SIZE)) {
+                dst_base = recv_buffer;
+            } else if constexpr (NODE_SIZE > 1) {
+                dst_base = recv_ptrs_local[token_peer];
+            } else {
+                dst_base = recv_buffer;
+            }
+            auto *x_token_dst = (uint4*)(dst_base + offset * token_bound);
+            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_bound; i += NUM_THREADS) {
+                auto val = ld_global_nc_uint4(&x_token_src[i]);
+                st_global_nc_uint4(&x_token_dst[i], val);
+            }
+            token += gridDim.x;
+        }
+
+        __threadfence_system();
+        grid.sync();
+
+        if (blockIdx.x == 0) {
+            if (warp_id == 0) {
+                if (elect_one_sync()) {
+                    *sync_counter = counter + 1;
+                    *token_counter = 0;
+                    st_mmio_u32(combine_send_done, epoch);
+                }
+            } else if (warp_id == 1) {
+                if constexpr (NODE_SIZE > 1) {
+                    auto local_rank = rank % NODE_SIZE;
+                    if (lane_id < NODE_SIZE) {
+                        st_release_u32(&sync_ptrs[lane_id][local_rank + NODE_SIZE], counter + 1);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     auto shared_to_local = [&](unsigned count) {
         #pragma unroll(NUM_STAGES)
@@ -110,9 +179,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         // Fetch the next batch.
         unsigned next_token = token + (NUM_STAGES + threadIdx.x) * gridDim.x;
         if (threadIdx.x < NUM_STAGES && next_token < num_efa_tokens) {
+            auto index = padded_index[next_token];
             shared_stages[threadIdx.x].offset = combine_send_offset[next_token];
-            shared_stages[threadIdx.x].index = padded_index[next_token];
-            shared_stages[threadIdx.x].rank = source_rank[next_token];
+            shared_stages[threadIdx.x].index = index;
+            shared_stages[threadIdx.x].rank = source_rank_by_final_index[index];
         }
         __syncthreads();
 
@@ -148,19 +218,21 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         shared_to_local(num_efa_tokens);
     }
 
-    if (threadIdx.x == 0) {
-        auto num_tokens = add_release_gpu_u32(token_counter, num_local_efa_tokens) + num_local_efa_tokens;
-        if (num_tokens == num_efa_tokens) {
-            st_mmio_b8(combine_send_done, 1);
-        }
+    grid.sync();
+
+    if (num_efa_tokens != 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        st_mmio_u32(combine_send_done, epoch);
     }
+
+    token = blockIdx.x;
 
     if (warp_id == 0) {
         unsigned next_token = token + lane_id * gridDim.x;
         if (next_token < num_recv_tokens && lane_id < NUM_STAGES) {
+            auto index = padded_index[next_token];
             shared_stages[lane_id].offset = combine_send_offset[next_token];
-            shared_stages[lane_id].index = padded_index[next_token];
-            shared_stages[lane_id].rank = source_rank[next_token];
+            shared_stages[lane_id].index = index;
+            shared_stages[lane_id].rank = source_rank_by_final_index[index];
         }
     }
     __syncthreads();
@@ -173,9 +245,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         // Fetch the next batch.
         unsigned next_token = token + (NUM_STAGES + threadIdx.x) * gridDim.x;
         if (threadIdx.x < NUM_STAGES && next_token < num_recv_tokens) {
+            auto index = padded_index[next_token];
             shared_stages[threadIdx.x].offset = combine_send_offset[next_token];
-            shared_stages[threadIdx.x].index = padded_index[next_token];
-            shared_stages[threadIdx.x].rank = source_rank[next_token];
+            shared_stages[threadIdx.x].index = index;
+            shared_stages[threadIdx.x].rank = source_rank_by_final_index[index];
         }
         __syncthreads();
 
@@ -194,14 +267,17 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 auto token_rank = local_stages[s].rank;
                 auto token_node = token_rank / NODE_SIZE;
                 if (token_node == rank_node) {
-                    unsigned first_peer = (token_rank / DP_SIZE) * DP_SIZE;
-                    // Copy the token into the recv buffer of the receiving node via NVLink.
-                    #pragma unroll(DP_SIZE)
-                    for (unsigned dp_peer = 0; dp_peer < DP_SIZE; dp_peer++) {
-                        auto token_peer = (first_peer + dp_peer) % NODE_SIZE;
-                        auto *x_token_dst = (uint4*)(recv_ptrs_local[token_peer] + offset * token_bound);
-                        st_global_nc_uint4(&x_token_dst[i], values[s]);
+                    auto token_peer = token_rank % NODE_SIZE;
+                    std::byte *dst_base;
+                    if (token_peer == (rank % NODE_SIZE)) {
+                        dst_base = recv_buffer;
+                    } else if constexpr (NODE_SIZE > 1) {
+                        dst_base = recv_ptrs_local[token_peer];
+                    } else {
+                        dst_base = recv_buffer;
                     }
+                    auto *x_token_dst = (uint4*)(dst_base + offset * token_bound);
+                    st_global_nc_uint4(&x_token_dst[i], values[s]);
                 }
             }
         }
@@ -214,6 +290,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         shared_to_local(num_recv_tokens);
     }
 
+    __threadfence_system();
     grid.sync();
 
     if (blockIdx.x == 0) {
@@ -221,7 +298,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
             if (elect_one_sync()) {
                 *sync_counter = counter + 1;
                 *token_counter = 0;
-                *tx_ready = 0;
+                st_mmio_u32(combine_send_done, epoch);
+                if (num_efa_tokens != 0) {
+                    *tx_ready = 0;
+                }
             }
         } else if (warp_id == 1) {
             if constexpr (NODE_SIZE > 1) {
@@ -247,15 +327,16 @@ int a2a_kernels::a2a_combine_send(
     uint8_t *tx_ready,
     uint8_t *send_buffer,
     uint8_t *recv_buffer,
-    uint32_t *source_rank,
+    uint32_t *source_rank_by_final_index,
     uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *combine_send_done,
+    uint32_t *combine_send_done,
     uint32_t *token_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
@@ -268,7 +349,7 @@ int a2a_kernels::a2a_combine_send(
         &tx_ready,
         &send_buffer,
         &recv_buffer,
-        &source_rank,
+        &source_rank_by_final_index,
         &combine_send_offset,
         &padded_index,
         &num_recv_tokens_ptr,
@@ -277,13 +358,32 @@ int a2a_kernels::a2a_combine_send(
         &sync_counter,
         &sync_ptrs,
         &recv_ptrs,
+        &current_epoch,
     };
 
     dim3 dimGrid(num_blocks, 1, 1);
 
     cudaError_t status;
 
+    void *wait_args[] = {
+        &tx_ready,
+        &num_recv_tokens_ptr,
+    };
+
     nvtxRangePush("combine_send");
+    status = cudaLaunchKernel(
+        (void *)&a2a_wait_tx_ready_kernel,
+        dim3(1, 1, 1),
+        dim3(WARP_SIZE, 1, 1),
+        wait_args,
+        0,
+        (cudaStream_t)stream
+    );
+    if (status != cudaSuccess) {
+        nvtxRangePop();
+        return status;
+    }
+
     LAUNCH_DP_SIZE(dp_size, DP_SIZE, {
         LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
             LAUNCH_TOKEN_DIM_COMBINE(token_dim, TokenDim, {

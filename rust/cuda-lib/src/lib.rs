@@ -12,7 +12,7 @@ pub mod cumem;
 mod error;
 mod mem;
 pub use error::{CudaError, CudaResult};
-pub use mem::{CudaDeviceMemory, CudaHostMemory};
+pub use mem::{CudaDeviceMemory, CudaHostMemory, device_ptr_to_vec};
 mod device;
 pub use device::{CudaDeviceId, Device};
 

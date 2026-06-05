@@ -26,6 +26,8 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     size_t rank,
     size_t world_size,
     size_t num_tokens,
+    size_t num_recv_tokens,
+    size_t max_recv_tokens,
     const int32_t *bound_m_ptr,
     const int32_t *indices_ptr,
     const size_t indices_stride,
@@ -35,18 +37,19 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     size_t out_tokens_stride,
     uint8_t accumulate,
     std::byte *recv_buffer,
-    uint32_t *token_offset,
-    uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
     uint8_t *combine_recv_flag,
-    uint8_t *combine_recv_done,
+    uint32_t *combine_recv_done,
     uint32_t *sync_counter,
-    uint32_t **sync_ptrs
+    uint32_t **sync_ptrs,
+    uint32_t * __restrict__ current_epoch
 ) {
     extern __shared__ std::byte shared_memory[];
 
     auto grid = cooperative_groups::this_grid();
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
 
     // Determine the number of tokens to combine on the current rank.
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
@@ -67,10 +70,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             const uint32_t global_slot = token * num_experts_per_token + route;
             const uint32_t local_slot = local_token * num_experts_per_token + route;
 
-            const uint32_t expert = indices_ptr[token * indices_stride + route];
-            const uint32_t offset = token_offset[global_slot];
-            const uint32_t position = (expert > 0 ? expert_offsets[expert - 1] : 0) + offset;
-            positions[local_slot] = position;
+            positions[local_slot] = combine_recv_position[global_slot];
             i += blockDim.x;
         }
         __syncthreads();
@@ -131,15 +131,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             for (unsigned j = threadIdx.x * VEC_SIZE; j < hidden_dim; j += blockDim.x * VEC_SIZE) {
                 AccTy acc = accumulate ? DstTy(dstPtr + j) : AccTy();
 
-                SrcTy srcs[NUM_EXPERTS];
                 #pragma unroll(NUM_EXPERTS)
                 for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
-                    srcs[k] = SrcTy(tokens[k] + j);
-                }
-
-                #pragma unroll(NUM_EXPERTS)
-                for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
-                    acc.add(weights[k], srcs[k]);
+                    acc.add(weights[k], SrcTy(tokens[k] + j));
                 }
 
                 acc.store(dstPtr + j);
@@ -152,7 +146,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (blockIdx.x == 0) {
         if (warp_id == 0) {
             if (elect_one_sync()) {
-                st_mmio_b8(combine_recv_done, 1);
                 *combine_recv_flag = 0;
                 *sync_counter = counter + 1;
             }
@@ -160,8 +153,13 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             auto local_rank = rank % NODE_SIZE;
             unsigned peer = lane_id;
             if (peer < NODE_SIZE) {
-                st_volatile_u32(&sync_ptrs[local_rank][peer], counter + 1);
+                st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
             }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            st_mmio_u32(combine_recv_done, epoch);
         }
     }
 }
@@ -179,6 +177,8 @@ int a2a_kernels::a2a_combine_recv(
     size_t node_size,
     size_t world_size,
     size_t num_tokens,
+    size_t num_recv_tokens,
+    size_t max_recv_tokens,
     const int32_t *bound_m_ptr,
     const int32_t *indices_ptr,
     size_t indices_stride,
@@ -188,12 +188,12 @@ int a2a_kernels::a2a_combine_recv(
     size_t out_tokens_stride,
     bool accumulate,
     uint8_t *recv_buffer,
-    uint32_t *token_offset,
-    uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
     uint8_t *combine_recv_flag,
-    uint8_t *combine_recv_done,
+    uint32_t *combine_recv_done,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
+    uint32_t *current_epoch,
     uint64_t stream
 ) {
     const size_t token_dim = round_up<size_t>(hidden_dim * x_elemsize, sizeof(int4));
@@ -207,6 +207,8 @@ int a2a_kernels::a2a_combine_recv(
         &rank,
         &world_size,
         &num_tokens,
+        &num_recv_tokens,
+        &max_recv_tokens,
         &bound_m_ptr,
         &indices_ptr,
         &indices_stride,
@@ -216,12 +218,12 @@ int a2a_kernels::a2a_combine_recv(
         &out_tokens_stride,
         &accumulate,
         &recv_buffer,
-        &token_offset,
-        &expert_offsets,
+        &combine_recv_position,
         &combine_recv_flag,
         &combine_recv_done,
         &sync_counter,
         &sync_ptrs,
+        &current_epoch,
     };
 
     constexpr size_t NUM_WARPS = 16;

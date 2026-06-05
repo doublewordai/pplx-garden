@@ -1,6 +1,8 @@
 # ruff: noqa: A002
 
 import torch
+from typing import Any
+
 
 from pplx_garden.fabric_lib import (
     DomainAddress,
@@ -21,6 +23,7 @@ class AllToAllContext:
         scale_elemsize: int | None,
         max_num_tokens: int,
         max_recv_tokens: int,
+        max_tokens_per_expert: int | None,
         max_private_tokens: int,
         num_experts: int,
         expert_padding: int,
@@ -29,26 +32,29 @@ class AllToAllContext:
         dp_size: int,
         node_size: int,
         world_size: int,
-        num_routed_ptr: int,
-        num_routed_mr: MemoryRegionHandle,
-        send_buffer_ptr: int,
-        send_buffer_mr: MemoryRegionHandle,
-        recv_buffer_ptr: int,
-        recv_buffer_mr: MemoryRegionHandle,
-        sync_ptrs: list[int],
-        send_ptrs: list[int],
-        recv_ptrs: list[int],
+        num_routed_ptrs: list[int],
+        num_routed_mrs: list[MemoryRegionHandle],
+        send_buffer_ptrs: list[int],
+        send_buffer_mrs: list[MemoryRegionHandle],
+        recv_buffer_ptrs: list[int],
+        recv_buffer_mrs: list[MemoryRegionHandle],
+        sync_ptrs: list[list[int]],
+        send_ptrs: list[list[int]],
+        recv_ptrs: list[list[int]],
+        node_route_count_ptrs: list[list[int]],
+        node_route_epoch_ptrs: list[list[int]],
         device: int,
         imm_base: int,
         ranks: list[
             tuple[
                 DomainAddress,
-                MemoryRegionDescriptor,
-                MemoryRegionDescriptor,
+                list[MemoryRegionDescriptor],
+                list[MemoryRegionDescriptor],
             ]
         ],
         transfer_engine: TransferEngine,
         worker_cpu: int | None,
+        num_slots: int,
     ) -> None: ...
     def dispatch_send(
         self,
@@ -64,9 +70,27 @@ class AllToAllContext:
         weights_stride: int,
         bound_m_ptr: int | None,
         stream: int,
-    ) -> None: ...
+    ) -> dict[str, int]: ...
+    def dispatch_send_on_slot(
+        self,
+        slot: int,
+        num_tokens: int,
+        x_ptr: int,
+        x_stride: int,
+        x_scale_ptr: int | None,
+        x_scale_stride_elem: int | None,
+        x_scale_stride_token: int | None,
+        indices_ptr: int,
+        indices_stride: int,
+        weights_ptr: int,
+        weights_stride: int,
+        bound_m_ptr: int | None,
+        stream: int,
+    ) -> dict[str, int]: ...
     def dispatch_recv(
         self,
+        slot: int,
+        generation: int,
         out_num_tokens_ptr: int,
         out_x_ptr: int,
         out_x_stride: int,
@@ -77,12 +101,16 @@ class AllToAllContext:
     ) -> None: ...
     def combine_send(
         self,
+        slot: int,
+        generation: int,
         expert_x_ptr: int,
         expert_x_stride: int,
         stream: int,
     ) -> None: ...
     def combine_recv(
         self,
+        slot: int,
+        generation: int,
         num_tokens: int,
         num_recv_tokens: int,
         expert_y_dtype: torch.dtype,
@@ -96,3 +124,5 @@ class AllToAllContext:
         accumulate: bool,
         stream: int,
     ) -> None: ...
+    def get_perf_stats(self) -> dict[str, Any]: ...
+    def uses_node_route_exchange(self) -> bool: ...

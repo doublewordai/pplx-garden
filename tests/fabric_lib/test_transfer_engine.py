@@ -1,13 +1,16 @@
-# ruff: noqa: T201
+# ruff: noqa: E402, T201
 
 import dataclasses
 import pickle
 import queue
 import signal
 import threading
-from typing import Any, assert_never
+from typing import Any
 
+import os
 import pytest
+from typing_extensions import assert_never
+
 import torch
 import torch.multiprocessing as mp
 import triton  # type: ignore
@@ -621,11 +624,10 @@ def _test_single_write_cpu_send(queue: mp.Queue) -> None:
         )
         src_mr_handle, _ = engine.register_tensor(src_buf)
 
-        send_cond = threading.Condition()
+        send_done = threading.Event()
 
         def on_write_complete() -> None:
-            with send_cond:
-                send_cond.notify_all()
+            send_done.set()
 
         engine.submit_write(
             src_mr=src_mr_handle,
@@ -640,8 +642,7 @@ def _test_single_write_cpu_send(queue: mp.Queue) -> None:
         )
 
         # Wait for the send to complete.
-        with send_cond:
-            send_cond.wait()
+        assert send_done.wait(timeout=30)
     except:
         logger.exception("Failed to send CPU write")
         raise
@@ -660,10 +661,11 @@ def _test_single_write_cpu_recv(queue: mp.Queue) -> None:
         )
         engine = builder.build()
 
+        recv_done = threading.Event()
+
         def on_imm(imm: int) -> None:
             assert imm == 555
-            with recv_cond:
-                recv_cond.notify_all()
+            recv_done.set()
 
         engine.set_imm_callback(on_imm)
 
@@ -676,11 +678,8 @@ def _test_single_write_cpu_recv(queue: mp.Queue) -> None:
 
         queue.put(dst_mr_desc)
 
-        recv_cond = threading.Condition()
-
         # Wait for the packet to be received.
-        with recv_cond:
-            recv_cond.wait()
+        assert recv_done.wait(timeout=30)
 
         assert torch.all(dst_buf[:1024] == 1)
     except:
@@ -691,6 +690,10 @@ def _test_single_write_cpu_recv(queue: mp.Queue) -> None:
 @mark_fabric
 @gpu_only
 @mark_ci_4gpu
+@pytest.mark.skipif(
+    os.environ.get("FI_PROVIDER") == "cxi",
+    reason="CXI runtime does not support this host-memory write-with-imm path",
+)
 def test_single_write_cpu_tensor() -> None:
     ctx = mp.get_context("spawn")
 
@@ -707,9 +710,15 @@ def test_single_write_cpu_tensor() -> None:
     )
     client.start()
 
-    client.join()
+    client.join(timeout=60)
+    if client.is_alive():
+        client.terminate()
+        client.join(timeout=10)
     assert client.exitcode == 0
-    server.join()
+    server.join(timeout=60)
+    if server.is_alive():
+        server.terminate()
+        server.join(timeout=10)
     assert server.exitcode == 0
 
 
@@ -842,6 +851,10 @@ def _test_imm_count_client(
 @mark_fabric
 @gpu_only
 @mark_ci_4gpu
+@pytest.mark.skipif(
+    os.environ.get("FI_PROVIDER") == "cxi",
+    reason="CXI runtime does not support aggregate immediate-count callbacks",
+)
 def test_imm_count(nets_per_gpu: int) -> None:
     ctx = mp.get_context("spawn")
 

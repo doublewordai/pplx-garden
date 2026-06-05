@@ -4,3 +4,4 @@ mod a2a_worker;
 
 pub use a2a_context::AllToAllContext;
 pub use a2a_handles::AllToAllRankHandle;
+pub use a2a_worker::LowLatencyRouteLayoutPlan;

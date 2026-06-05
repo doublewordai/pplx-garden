@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+
 from pplx_garden.fabric_lib import DomainAddress
 
 

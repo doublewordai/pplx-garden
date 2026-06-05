@@ -1,4 +1,4 @@
-# ruff: noqa: T201
+# ruff: noqa: E402, T201
 
 import pickle
 

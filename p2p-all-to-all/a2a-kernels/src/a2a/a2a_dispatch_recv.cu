@@ -24,7 +24,10 @@ void a2a_dispatch_recv_kernel(
     size_t x_elemsize,
     size_t x_scale_elemsize,
     size_t num_experts,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
+    size_t dp_size,
     size_t world_size,
     int32_t * __restrict__ out_num_tokens_ptr,
     std::byte * __restrict__ out_x_ptr,
@@ -37,16 +40,26 @@ void a2a_dispatch_recv_kernel(
     std::byte * __restrict__ recv_buffer,
     uint32_t * __restrict__ source_rank,
     uint32_t * __restrict__ source_offset,
+    uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
+    uint32_t * __restrict__ source_rank_by_final_index,
+    uint32_t * __restrict__ source_token_index,
+    uint32_t * __restrict__ source_route_index,
+    uint32_t * __restrict__ source_expert_index,
     uint32_t * __restrict__ num_routed,
+    uint32_t ** __restrict__ dispatch_source_counts_ptrs,
+    uint32_t ** __restrict__ dispatch_source_count_epochs_ptrs,
+    bool use_device_source_counts,
     uint32_t * __restrict__ num_recv_tokens_ptr,
-    uint8_t * __restrict__ num_recv_tokens_flag,
+    uint32_t * __restrict__ num_recv_tokens_ready,
     uint8_t * __restrict__ dispatch_recv_flag,
-    uint8_t * __restrict__ dispatch_recv_done,
+    uint32_t * __restrict__ dispatch_recv_done,
     uint32_t * __restrict__ grid_counter,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
-    std::byte **send_ptrs
+    std::byte **send_ptrs,
+    uint32_t * __restrict__ current_epoch,
+    bool skip_rect_payload_copy
 ) {
     TokenDimTy token_dim_bound(token_dim);
     HiddenDimScaleTy hidden_dim_scale_bound(hidden_dim_scale);
@@ -60,6 +73,7 @@ void a2a_dispatch_recv_kernel(
         uint4 *x_token_dst;
         float *x_scale_src;
         float *x_scale_dst;
+        uint32_t dst_index;
     };
     constexpr size_t NUM_STAGES = 8;
 
@@ -75,6 +89,7 @@ void a2a_dispatch_recv_kernel(
             local_stage[i].x_scale_src = (float*)(recv_buffer + src_index * token_stride + token_dim_bound);
             local_stage[i].x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
             local_stage[i].x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+            local_stage[i].dst_index = dst_index;
         }
         __syncthreads();
     };
@@ -83,16 +98,27 @@ void a2a_dispatch_recv_kernel(
     auto block = cooperative_groups::this_thread_block();
     const unsigned warp_id = threadIdx.x / WARP_SIZE;
     const unsigned lane_id = get_lane_id();
+    const uint32_t epoch = *current_epoch;
 
-    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
-    const size_t first_expert = rank * experts_per_rank;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *grid_counter = 0;
+    }
+    grid.sync();
+
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size / dp_size);
+    const size_t first_expert = (rank / dp_size) * experts_per_rank;
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
+    const size_t num_local_experts = last_expert - first_expert;
+    const bool use_rect_transport_recv = num_max_dispatch_tokens_per_rank > 0
+        && dp_size == 1
+        && world_size == NODE_SIZE
+        && num_local_experts * num_max_dispatch_tokens_per_rank <= max_private_tokens;
 
     // Wait for NVLink transfers to complete.
     auto counter = *sync_counter;
-    if (warp_id == 0) {
+    if (warp_id == 0 && !(use_rect_transport_recv && use_device_source_counts)) {
         if (elect_one_sync()) {
-            while (ld_mmio_b8(num_recv_tokens_flag) == 0);
+            while (ld_mmio_u32(num_recv_tokens_ready) != epoch);
         }
     } else if (warp_id == 1) {
         if constexpr (NODE_SIZE > 1) {
@@ -108,6 +134,169 @@ void a2a_dispatch_recv_kernel(
     // Wait for the worker to indicate the number of tokens received.
     const unsigned num_recv_tokens = ld_volatile_u32(num_recv_tokens_ptr);
     const unsigned num_efa_tokens = ld_volatile_u32(num_recv_tokens_ptr + 1);
+
+    if (use_rect_transport_recv) {
+        const size_t max_tokens_per_expert = num_max_dispatch_tokens_per_rank * (world_size / dp_size);
+        const size_t dp_group = rank / dp_size;
+        const size_t groups_per_node = NODE_SIZE / dp_size;
+        const size_t slots_per_source_group = num_local_experts * num_max_dispatch_tokens_per_rank;
+        const size_t total_rect_slots = (world_size / dp_size) * slots_per_source_group;
+        const uint32_t *source_counts = use_device_source_counts
+            ? dispatch_source_counts_ptrs[rank % NODE_SIZE]
+            : num_routed;
+
+        if (use_device_source_counts && blockIdx.x == 0) {
+            uint32_t *source_count_epochs =
+                dispatch_source_count_epochs_ptrs[rank % NODE_SIZE];
+            for (uint32_t source = threadIdx.x; source < NODE_SIZE; source += blockDim.x) {
+                while (ld_acquire_u32(&source_count_epochs[source]) != epoch);
+            }
+        }
+        grid.sync();
+
+        if (use_device_source_counts && blockIdx.x == 0) {
+            for (uint32_t local_expert = threadIdx.x; local_expert < num_local_experts; local_expert += blockDim.x) {
+                const uint32_t expert = first_expert + local_expert;
+                uint32_t count = 0;
+                for (uint32_t source_group = 0; source_group < world_size; ++source_group) {
+                    count += __ldg(source_counts + source_group * num_experts + expert);
+                }
+                tokens_per_expert[local_expert] = count;
+                out_num_tokens_ptr[local_expert] = count;
+            }
+            if (threadIdx.x == 0) {
+                uint32_t total = 0;
+                for (uint32_t local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                    const uint32_t expert = first_expert + local_expert;
+                    for (uint32_t source_group = 0; source_group < world_size; ++source_group) {
+                        total += __ldg(source_counts + source_group * num_experts + expert);
+                    }
+                }
+                num_recv_tokens_ptr[0] = total;
+                num_recv_tokens_ptr[1] = 0;
+                num_recv_tokens_ptr[2] = 0;
+                st_mmio_u32(num_recv_tokens_ready, epoch);
+            }
+        }
+        grid.sync();
+
+        for (size_t linear = blockIdx.x; linear < total_rect_slots; linear += gridDim.x) {
+            const size_t source_group = linear / slots_per_source_group;
+            const size_t local_slot = linear - source_group * slots_per_source_group;
+            const size_t local_expert = local_slot / num_max_dispatch_tokens_per_rank;
+            const size_t token_in_source_expert = local_slot - local_expert * num_max_dispatch_tokens_per_rank;
+            const size_t expert = first_expert + local_expert;
+            const uint32_t source_count = __ldg(source_counts + source_group * num_experts + expert);
+            if (token_in_source_expert >= source_count) {
+                continue;
+            }
+
+            uint32_t source_group_offset = 0;
+            for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                if (ordered_group == source_group) {
+                    break;
+                }
+                source_group_offset += __ldg(source_counts + ordered_group * num_experts + expert);
+            }
+            uint32_t compact_index = 0;
+            if (source_group == dp_group) {
+                for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                    const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                    for (size_t prior_local_expert = 0; prior_local_expert < num_local_experts; ++prior_local_expert) {
+                        compact_index += __ldg(source_counts + ordered_group * num_experts + first_expert + prior_local_expert);
+                    }
+                }
+            } else {
+                for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                    const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                    if (ordered_group == source_group) {
+                        break;
+                    }
+                    for (size_t prior_local_expert = 0; prior_local_expert < num_local_experts; ++prior_local_expert) {
+                        compact_index += __ldg(source_counts + ordered_group * num_experts + first_expert + prior_local_expert);
+                    }
+                }
+            }
+            for (size_t prior_local_expert = 0; prior_local_expert < local_expert; ++prior_local_expert) {
+                compact_index += __ldg(source_counts + source_group * num_experts + first_expert + prior_local_expert);
+            }
+            compact_index += token_in_source_expert;
+
+            uint32_t source_expert_offset = 0;
+            for (uint32_t prior_expert = 0; prior_expert < expert; ++prior_expert) {
+                source_expert_offset += __ldg(source_counts + source_group * num_experts + prior_expert);
+            }
+            const uint32_t source_rank_value = source_group * dp_size + (rank % dp_size);
+            const uint32_t dst_index = local_expert * max_tokens_per_expert
+                + source_group_offset
+                + token_in_source_expert;
+            const uint32_t src_index = source_group * max_private_tokens
+                + local_expert * num_max_dispatch_tokens_per_rank
+                + token_in_source_expert;
+
+            std::byte *src_base = source_rank_value == rank ? send_buffer : recv_buffer;
+            std::byte *metadata_token = src_base + src_index * token_stride;
+
+            auto *source_route_info = (uint32_t*)(metadata_token + token_dim_bound + token_scale_dim);
+            if (threadIdx.x == 0) {
+                source_rank_by_final_index[dst_index] = source_rank_value;
+                source_token_index[dst_index] = source_route_info[0];
+                source_route_index[dst_index] = source_route_info[1];
+                source_expert_index[dst_index] = source_route_info[2];
+                padded_index[compact_index] = dst_index;
+                source_rank[compact_index] = source_rank_value;
+                source_offset[compact_index] = src_index;
+                combine_send_offset[compact_index] = source_expert_offset + token_in_source_expert;
+            }
+
+            if (!skip_rect_payload_copy) {
+                uint4 *x_token_src = (uint4*)metadata_token;
+                uint4 *x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
+                float *x_scale_src = (float*)(metadata_token + token_dim);
+                float *x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+
+                for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
+                    const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
+                    auto val = ld_global_nc_uint4(&x_token_src[i]);
+                    st_global_nc_uint4(&x_token_dst[i], val);
+                    if (has_scale) {
+                        x_scale_dst[i * out_x_scale_stride_elem] = x_scale_src[i];
+                    }
+                }
+            }
+        }
+
+        if (!use_device_source_counts && blockIdx.x == 0) {
+            for (unsigned expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
+                out_num_tokens_ptr[expert] = tokens_per_expert[expert];
+            }
+        }
+
+        grid.sync();
+
+        // Match the normal dispatch-recv path's NVLink barrier. Combine-send
+        // waits on this before reusing the per-slot send/recv buffers.
+        if constexpr (NODE_SIZE > 1) {
+            if (blockIdx.x == 0) {
+                if (threadIdx.x == 0) {
+                    *sync_counter = counter + 1;
+                }
+                auto local_rank = rank % NODE_SIZE;
+                for (unsigned peer = threadIdx.x; peer < NODE_SIZE; peer += blockDim.x) {
+                    st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
+                }
+            }
+            grid.sync();
+        }
+
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            __threadfence_system();
+            st_mmio_u32(dispatch_recv_done, epoch);
+            *dispatch_recv_flag = 0;
+        }
+        return;
+    }
 
     // Pre-populate token information into the pipeline.
     auto next_token = blockIdx.x + threadIdx.x * gridDim.x;
@@ -136,6 +325,16 @@ void a2a_dispatch_recv_kernel(
         }
 
         // Token originates from the local node - copy it from an NVLink buffer.
+        auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+        auto source_token = source_route_info[0];
+        auto source_route = source_route_info[1];
+        auto source_expert = source_route_info[2];
+        if (threadIdx.x == 0) {
+            source_rank_by_final_index[padded_token] = token_rank;
+            source_token_index[padded_token] = source_token;
+            source_route_index[padded_token] = source_route;
+            source_expert_index[padded_token] = source_expert;
+        }
         uint4 *x_token_dst = (uint4*)(out_x_ptr + padded_token * out_x_stride);
         float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
         float *x_scale_dst = (float*)(out_x_scale_ptr + padded_token * out_x_scale_stride_token);
@@ -196,6 +395,16 @@ void a2a_dispatch_recv_kernel(
             uint4 *x_token_dst = local_stage[s].x_token_dst;
             float *x_scale_dst = local_stage[s].x_scale_dst;
             float *x_scale_src = local_stage[s].x_scale_src;
+            if (threadIdx.x == 0) {
+                auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+                auto source_token = source_route_info[0];
+                auto source_route = source_route_info[1];
+                auto source_expert = source_route_info[2];
+                source_rank_by_final_index[local_stage[s].dst_index] = source_rank[token];
+                source_token_index[local_stage[s].dst_index] = source_token;
+                source_route_index[local_stage[s].dst_index] = source_route;
+                source_expert_index[local_stage[s].dst_index] = source_expert;
+            }
 
             for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
                 const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
@@ -223,15 +432,13 @@ void a2a_dispatch_recv_kernel(
         }
     }
 
-    if (threadIdx.x == 0) {
-        auto counter = add_release_gpu_u32(grid_counter, num_local_tokens) + num_local_tokens;
-        if (counter == num_efa_tokens) {
-            st_mmio_b8(dispatch_recv_done, 1);
-            // Reset the state.
-            *num_recv_tokens_flag = 0;
-            *dispatch_recv_flag = 0;
-            *grid_counter = 0;
-        }
+    grid.sync();
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+        st_mmio_u32(dispatch_recv_done, epoch);
+        // Reset the state.
+        *dispatch_recv_flag = 0;
     }
 }
 
@@ -243,7 +450,10 @@ int a2a_kernels::a2a_dispatch_recv(
     size_t x_elemsize,
     size_t x_scale_elemsize,
     size_t num_experts,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
+    size_t dp_size,
     size_t node_size,
     size_t world_size,
     int32_t *out_num_tokens_ptr,
@@ -257,16 +467,26 @@ int a2a_kernels::a2a_dispatch_recv(
     uint8_t *recv_buffer,
     uint32_t *source_rank,
     uint32_t *source_offset,
+    uint32_t *combine_send_offset,
     uint32_t *padded_index,
+    uint32_t *source_rank_by_final_index,
+    uint32_t *source_token_index,
+    uint32_t *source_route_index,
+    uint32_t *source_expert_index,
     uint32_t *num_routed,
+    uint32_t **dispatch_source_counts_ptrs,
+    uint32_t **dispatch_source_count_epochs_ptrs,
+    bool use_device_source_counts,
     uint32_t *num_recv_tokens_ptr,
-    uint8_t *num_recv_tokens_flag,
+    uint32_t *num_recv_tokens_ready,
     uint8_t *dispatch_recv_flag,
-    uint8_t *dispatch_recv_done,
+    uint32_t *dispatch_recv_done,
     uint32_t *grid_counter,
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **send_ptrs,
+    uint32_t *current_epoch,
+    bool skip_rect_payload_copy,
     uint64_t stream
 ) {
     constexpr size_t NUM_WARPS = 16;
@@ -288,7 +508,10 @@ int a2a_kernels::a2a_dispatch_recv(
         &x_elemsize,
         &x_scale_elemsize,
         &num_experts,
+        &max_private_tokens,
+        &num_max_dispatch_tokens_per_rank,
         &rank,
+        &dp_size,
         &world_size,
         &out_num_tokens_ptr,
         &out_x_ptr,
@@ -301,16 +524,26 @@ int a2a_kernels::a2a_dispatch_recv(
         &recv_buffer,
         &source_rank,
         &source_offset,
+        &combine_send_offset,
         &padded_index,
+        &source_rank_by_final_index,
+        &source_token_index,
+        &source_route_index,
+        &source_expert_index,
         &num_routed,
+        &dispatch_source_counts_ptrs,
+        &dispatch_source_count_epochs_ptrs,
+        &use_device_source_counts,
         &num_recv_tokens_ptr,
-        &num_recv_tokens_flag,
+        &num_recv_tokens_ready,
         &dispatch_recv_flag,
         &dispatch_recv_done,
         &grid_counter,
         &sync_counter,
         &sync_ptrs,
         &send_ptrs,
+        &current_epoch,
+        &skip_rect_payload_copy,
     };
 
     nvtxRangePush("dispatch_recv");

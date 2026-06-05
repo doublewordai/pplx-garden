@@ -409,6 +409,9 @@ fn rdma_worker_thread<D: RdmaDomain, const N: usize>(
         std::hint::spin_loop();
         let ret = worker_step(&mut group, &call_rx, &cmd_rx, &cq_tx);
         if ret.is_err() {
+            if stop_signal.load(SeqCst) {
+                break;
+            }
             panic!("fabric-lib internal error: Worker step failed");
         }
     }
@@ -548,6 +551,9 @@ fn uvm_worker_thread(
         std::hint::spin_loop();
         let ret = uwm_worker_step(&mut uvm_ctx, &call_rx, &cq_tx);
         if ret.is_err() {
+            if stop_signal.load(SeqCst) {
+                break;
+            }
             panic!("fabric-lib internal error: Worker step failed");
         }
     }
