@@ -127,6 +127,8 @@ struct DeviceWorkspace {
     low_latency_expert_num_tokens_ptrs: Option<CudaDeviceMemory>,
     /// Device-side low-latency source count-table pointers.
     low_latency_dispatch_source_counts_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency source count-ready epoch pointers.
+    low_latency_dispatch_source_count_epochs_ptrs: Option<CudaDeviceMemory>,
 }
 
 impl DeviceWorkspace {
@@ -211,6 +213,7 @@ impl DeviceWorkspace {
             low_latency_expert_x_scale_ptrs: None,
             low_latency_expert_num_tokens_ptrs: None,
             low_latency_dispatch_source_counts_ptrs: None,
+            low_latency_dispatch_source_count_epochs_ptrs: None,
         })
     }
 
@@ -246,6 +249,7 @@ impl DeviceWorkspace {
         expert_x_scale_ptrs: Option<&[u64]>,
         expert_num_tokens_ptrs: &[u64],
         dispatch_source_counts_ptrs: &[u64],
+        dispatch_source_count_epochs_ptrs: &[u64],
     ) -> Result<(), CudartError> {
         self.low_latency_expert_x_ptrs =
             Some(CudaDeviceMemory::from_vec(expert_x_ptrs)?);
@@ -257,6 +261,8 @@ impl DeviceWorkspace {
             Some(CudaDeviceMemory::from_vec(expert_num_tokens_ptrs)?);
         self.low_latency_dispatch_source_counts_ptrs =
             Some(CudaDeviceMemory::from_vec(dispatch_source_counts_ptrs)?);
+        self.low_latency_dispatch_source_count_epochs_ptrs =
+            Some(CudaDeviceMemory::from_vec(dispatch_source_count_epochs_ptrs)?);
         Ok(())
     }
 
@@ -281,6 +287,12 @@ impl DeviceWorkspace {
 
     fn get_low_latency_dispatch_source_counts_ptr(&mut self) -> *mut *mut u32 {
         self.low_latency_dispatch_source_counts_ptrs
+            .as_mut()
+            .map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    fn get_low_latency_dispatch_source_count_epochs_ptr(&mut self) -> *mut *mut u32 {
+        self.low_latency_dispatch_source_count_epochs_ptrs
             .as_mut()
             .map_or(null_mut(), |p| p.get_mut_ptr())
     }
@@ -657,6 +669,8 @@ impl AllToAllContext {
             self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_num_tokens")?;
         let dispatch_source_counts_ptrs =
             self.low_latency_tensor_ptrs(&tensor_ptrs, "dispatch_source_counts")?;
+        let dispatch_source_count_epochs_ptrs =
+            self.low_latency_tensor_ptrs(&tensor_ptrs, "dispatch_source_count_epochs")?;
         let expert_x_scale_ptrs = if self.scale_elemsize > 0 {
             Some(self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_x_scale")?)
         } else {
@@ -669,6 +683,7 @@ impl AllToAllContext {
                 expert_x_scale_ptrs.as_ref().map(|ptrs| ptrs[slot].as_slice()),
                 &expert_num_tokens_ptrs[slot],
                 &dispatch_source_counts_ptrs[slot],
+                &dispatch_source_count_epochs_ptrs[slot],
             )?;
         }
         Ok(())
@@ -981,6 +996,8 @@ impl AllToAllContext {
             workspace.get_low_latency_expert_x_scale_ptr() as *mut *mut u8;
         let low_latency_dispatch_source_counts_ptrs =
             workspace.get_low_latency_dispatch_source_counts_ptr();
+        let low_latency_dispatch_source_count_epochs_ptrs =
+            workspace.get_low_latency_dispatch_source_count_epochs_ptr();
 
         if trace {
             eprintln!(
@@ -1046,6 +1063,7 @@ impl AllToAllContext {
                     std::ptr::null_mut()
                 },
                 low_latency_dispatch_source_counts_ptrs,
+                low_latency_dispatch_source_count_epochs_ptrs,
                 worker.slot.num_recv_tokens_ready.get_device_ptr(),
                 workspace.epoch_counter.get_mut_ptr(),
                 workspace.current_epoch.get_mut_ptr(),
@@ -1225,6 +1243,7 @@ impl AllToAllContext {
             workspace.source_expert_index.get_mut_ptr(),
             worker.buffers.num_routed_ptr,
             workspace.get_low_latency_dispatch_source_counts_ptr(),
+            workspace.get_low_latency_dispatch_source_count_epochs_ptr(),
             use_device_source_counts,
             worker.slot.num_recv_tokens.get_device_ptr(),
             worker.slot.num_recv_tokens_ready.get_device_ptr(),
@@ -1454,6 +1473,14 @@ impl AllToAllContext {
             &mut total_bytes,
             "dispatch_source_counts",
             vec![num_ep_groups, self.num_experts],
+            "uint32",
+            ScalarType::U32.element_size(),
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
+            "dispatch_source_count_epochs",
+            vec![num_ep_groups],
             "uint32",
             ScalarType::U32.element_size(),
         );

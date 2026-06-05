@@ -48,6 +48,7 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ source_expert_index,
     uint32_t * __restrict__ num_routed,
     uint32_t ** __restrict__ dispatch_source_counts_ptrs,
+    uint32_t ** __restrict__ dispatch_source_count_epochs_ptrs,
     bool use_device_source_counts,
     uint32_t * __restrict__ num_recv_tokens_ptr,
     uint32_t * __restrict__ num_recv_tokens_ready,
@@ -143,6 +144,15 @@ void a2a_dispatch_recv_kernel(
         const uint32_t *source_counts = use_device_source_counts
             ? dispatch_source_counts_ptrs[rank % NODE_SIZE]
             : num_routed;
+
+        if (use_device_source_counts && blockIdx.x == 0) {
+            uint32_t *source_count_epochs =
+                dispatch_source_count_epochs_ptrs[rank % NODE_SIZE];
+            for (uint32_t source = threadIdx.x; source < NODE_SIZE; source += blockDim.x) {
+                while (ld_acquire_u32(&source_count_epochs[source]) != epoch);
+            }
+        }
+        grid.sync();
 
         if (use_device_source_counts && blockIdx.x == 0) {
             for (uint32_t local_expert = threadIdx.x; local_expert < num_local_experts; local_expert += blockDim.x) {
@@ -465,6 +475,7 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t *source_expert_index,
     uint32_t *num_routed,
     uint32_t **dispatch_source_counts_ptrs,
+    uint32_t **dispatch_source_count_epochs_ptrs,
     bool use_device_source_counts,
     uint32_t *num_recv_tokens_ptr,
     uint32_t *num_recv_tokens_ready,
@@ -521,6 +532,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &source_expert_index,
         &num_routed,
         &dispatch_source_counts_ptrs,
+        &dispatch_source_count_epochs_ptrs,
         &use_device_source_counts,
         &num_recv_tokens_ptr,
         &num_recv_tokens_ready,

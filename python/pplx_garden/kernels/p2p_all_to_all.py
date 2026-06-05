@@ -1327,7 +1327,7 @@ class P2PAllToAll(AllToAllKernel):
                 weights=weights,
                 bound_m=bound_m,
                 slot=slot_key,
-                _direct_to_low_latency_workspace=False,
+                _direct_to_low_latency_workspace=True,
                 _use_low_latency_rect_transport=True,
             )
             handle.workspace_lease = lease

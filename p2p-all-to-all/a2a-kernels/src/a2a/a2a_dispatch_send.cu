@@ -621,6 +621,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_no
     uint32_t ** __restrict__ sync_ptrs,
     std::byte ** __restrict__ recv_ptrs,
     uint32_t ** __restrict__ dispatch_source_counts_ptrs,
+    uint32_t ** __restrict__ dispatch_source_count_epochs_ptrs,
     uint32_t * __restrict__ epoch_counter,
     uint32_t * __restrict__ current_epoch
 ) {
@@ -678,6 +679,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_no
                 local_num_routed[expert];
         }
         __threadfence_system();
+        for (uint32_t peer = threadIdx.x; peer < world_size; peer += blockDim.x) {
+            st_release_u32(&dispatch_source_count_epochs_ptrs[peer][source_group], epoch);
+        }
     }
     grid.sync();
 
@@ -748,6 +752,7 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
     std::byte ** __restrict__ expert_x_ptrs,
     std::byte ** __restrict__ expert_x_scale_ptrs,
     uint32_t ** __restrict__ dispatch_source_counts_ptrs,
+    uint32_t ** __restrict__ dispatch_source_count_epochs_ptrs,
     uint32_t * __restrict__ num_recv_tokens_ready,
     uint32_t * __restrict__ current_epoch
 ) {
@@ -759,6 +764,16 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
     const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
     const size_t source_group = rank;
+    const uint32_t epoch = *current_epoch;
+
+    if (blockIdx.x == 0) {
+        uint32_t *dst_source_count_epochs =
+            dispatch_source_count_epochs_ptrs[rank % node_size];
+        for (uint32_t source = threadIdx.x; source < node_size; source += blockDim.x) {
+            while (ld_acquire_u32(&dst_source_count_epochs[source]) != epoch);
+        }
+    }
+    grid.sync();
 
     auto store_source_route_info = [&](std::byte *token_ptr, uint32_t token, uint32_t route, uint32_t expert) {
         if (lane_id == 0) {
@@ -872,6 +887,7 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
     uint8_t **expert_x_ptrs,
     uint8_t **expert_x_scale_ptrs,
     uint32_t **dispatch_source_counts_ptrs,
+    uint32_t **dispatch_source_count_epochs_ptrs,
     uint32_t *num_recv_tokens_ready,
     uint32_t *epoch_counter,
     uint32_t *current_epoch,
@@ -923,6 +939,7 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
         &sync_ptrs,
         &recv_ptrs,
         &dispatch_source_counts_ptrs,
+        &dispatch_source_count_epochs_ptrs,
         &epoch_counter,
         &current_epoch,
     };
@@ -958,6 +975,7 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
         &expert_x_ptrs,
         &expert_x_scale_ptrs,
         &dispatch_source_counts_ptrs,
+        &dispatch_source_count_epochs_ptrs,
         &num_recv_tokens_ready,
         &current_epoch,
     };
