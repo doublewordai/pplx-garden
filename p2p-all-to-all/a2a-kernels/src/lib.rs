@@ -70,6 +70,44 @@ mod ffi {
             stream: u64,
         ) -> i32;
 
+        unsafe fn a2a_dispatch_send_node_rect(
+            num_blocks: usize,
+            hidden_dim: usize,
+            hidden_dim_scale: usize,
+            num_experts: usize,
+            num_experts_per_token: usize,
+            max_private_tokens: usize,
+            num_max_dispatch_tokens_per_rank: usize,
+            rank: usize,
+            node_size: usize,
+            world_size: usize,
+            num_tokens: usize,
+            bound_m_ptr: *const i32,
+            x_ptr: *const u8,
+            x_elemsize: usize,
+            x_stride: usize,
+            x_scale_ptr: *const u8,
+            x_scale_elemsize: usize,
+            x_scale_stride_elem: usize,
+            x_scale_stride_token: usize,
+            indices: *const i32,
+            indices_stride: usize,
+            token_offset: *mut u32,
+            num_routed: *mut u32,
+            expert_offsets: *mut u32,
+            combine_recv_position: *mut u32,
+            dispatch_route_done: *mut u32,
+            dispatch_send_done: *mut u32,
+            tx_ready: *mut u8,
+            send_buffer: *mut u8,
+            sync_counter: *mut u32,
+            sync_ptrs: *mut *mut u32,
+            recv_ptrs: *mut *mut u8,
+            epoch_counter: *mut u32,
+            current_epoch: *mut u32,
+            stream: u64,
+        ) -> i32;
+
         unsafe fn a2a_dispatch_recv(
             num_blocks: usize,
             hidden_dim: usize,
@@ -173,5 +211,5 @@ mod ffi {
 
 pub use ffi::{
     a2a_combine_recv, a2a_combine_send, a2a_dispatch_recv, a2a_dispatch_route,
-    a2a_dispatch_send,
+    a2a_dispatch_send, a2a_dispatch_send_node_rect,
 };

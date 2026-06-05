@@ -76,6 +76,44 @@ int a2a_dispatch_send(
     uint64_t stream
 );
 
+int a2a_dispatch_send_node_rect(
+    size_t num_blocks,
+    size_t hidden_dim,
+    size_t hidden_dim_scale,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
+    size_t rank,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t *bound_m_ptr,
+    const uint8_t *x_ptr,
+    size_t x_elemsize,
+    size_t x_stride,
+    const uint8_t *x_scale_ptr,
+    size_t x_scale_elemsize,
+    size_t x_scale_stride_elem,
+    size_t x_scale_stride_token,
+    const int32_t *indices,
+    size_t indices_stride,
+    uint32_t *token_offset,
+    uint32_t *num_routed,
+    uint32_t *expert_offsets,
+    uint32_t *combine_recv_position,
+    uint32_t *dispatch_route_done,
+    uint32_t *dispatch_send_done,
+    uint8_t *tx_ready,
+    uint8_t *send_buffer,
+    uint32_t *sync_counter,
+    uint32_t **sync_ptrs,
+    uint8_t **recv_ptrs,
+    uint32_t *epoch_counter,
+    uint32_t *current_epoch,
+    uint64_t stream
+);
+
 int a2a_dispatch_recv(
     size_t num_blocks,
     size_t hidden_dim,

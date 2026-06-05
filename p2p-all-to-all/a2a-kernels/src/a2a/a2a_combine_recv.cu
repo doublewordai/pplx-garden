@@ -131,15 +131,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             for (unsigned j = threadIdx.x * VEC_SIZE; j < hidden_dim; j += blockDim.x * VEC_SIZE) {
                 AccTy acc = accumulate ? DstTy(dstPtr + j) : AccTy();
 
-                SrcTy srcs[NUM_EXPERTS];
                 #pragma unroll(NUM_EXPERTS)
                 for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
-                    srcs[k] = SrcTy(tokens[k] + j);
-                }
-
-                #pragma unroll(NUM_EXPERTS)
-                for (unsigned k = 0; k < NUM_EXPERTS; ++k) {
-                    acc.add(weights[k], srcs[k]);
+                    acc.add(weights[k], SrcTy(tokens[k] + j));
                 }
 
                 acc.store(dstPtr + j);
