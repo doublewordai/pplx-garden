@@ -77,6 +77,8 @@ mod ffi {
             x_elemsize: usize,
             x_scale_elemsize: usize,
             num_experts: usize,
+            max_private_tokens: usize,
+            num_max_dispatch_tokens_per_rank: usize,
             rank: usize,
             dp_size: usize,
             node_size: usize,

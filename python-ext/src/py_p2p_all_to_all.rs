@@ -28,6 +28,8 @@ fn low_latency_route_layout_plan_to_dict<'py>(
     dict.set_item("source_token_index", plan.source_token_index)?;
     dict.set_item("source_route_index", plan.source_route_index)?;
     dict.set_item("source_expert_index", plan.source_expert_index)?;
+    dict.set_item("combine_send_offset", plan.combine_send_offset)?;
+    dict.set_item("combine_recv_position", plan.combine_recv_position)?;
     dict.set_item(
         "tokens_per_source_group_per_local_expert",
         plan.tokens_per_source_group_per_local_expert,

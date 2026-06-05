@@ -83,6 +83,8 @@ int a2a_dispatch_recv(
     size_t x_elemsize,
     size_t x_scale_elemsize,
     size_t num_experts,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t node_size,

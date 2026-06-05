@@ -81,6 +81,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
 
     const unsigned num_recv_tokens = __ldg(num_recv_tokens_ptr);
     const unsigned num_efa_tokens = __ldg(num_recv_tokens_ptr + 1);
+    const bool use_metadata_direct_combine = DP_SIZE == 1 && NODE_SIZE > 1 && num_efa_tokens == 0;
 
     // Pick a token to send.
     unsigned token = blockIdx.x;
@@ -115,6 +116,53 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         }
     }
     __syncthreads();
+
+    if (use_metadata_direct_combine) {
+        token = blockIdx.x;
+        while (token < num_recv_tokens) {
+            const uint32_t final_index = padded_index[token];
+            const uint32_t token_rank = source_rank_by_final_index[final_index];
+            const uint32_t offset = combine_send_offset[token];
+            const uint32_t token_peer = token_rank % NODE_SIZE;
+
+            auto *x_token_src = (uint4*)(expert_x_ptr + expert_x_stride * final_index);
+            std::byte *dst_base;
+            if (token_peer == (rank % NODE_SIZE)) {
+                dst_base = recv_buffer;
+            } else if constexpr (NODE_SIZE > 1) {
+                dst_base = recv_ptrs_local[token_peer];
+            } else {
+                dst_base = recv_buffer;
+            }
+            auto *x_token_dst = (uint4*)(dst_base + offset * token_bound);
+            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_bound; i += NUM_THREADS) {
+                auto val = ld_global_nc_uint4(&x_token_src[i]);
+                st_global_nc_uint4(&x_token_dst[i], val);
+            }
+            token += gridDim.x;
+        }
+
+        __threadfence_system();
+        grid.sync();
+
+        if (blockIdx.x == 0) {
+            if (warp_id == 0) {
+                if (elect_one_sync()) {
+                    *sync_counter = counter + 1;
+                    *token_counter = 0;
+                    st_mmio_u32(combine_send_done, epoch);
+                }
+            } else if (warp_id == 1) {
+                if constexpr (NODE_SIZE > 1) {
+                    auto local_rank = rank % NODE_SIZE;
+                    if (lane_id < NODE_SIZE) {
+                        st_release_u32(&sync_ptrs[lane_id][local_rank + NODE_SIZE], counter + 1);
+                    }
+                }
+            }
+        }
+        return;
+    }
 
     auto shared_to_local = [&](unsigned count) {
         #pragma unroll(NUM_STAGES)
@@ -221,7 +269,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
                 if (token_node == rank_node) {
                     auto token_peer = token_rank % NODE_SIZE;
                     std::byte *dst_base;
-                    if constexpr (NODE_SIZE > 1) {
+                    if (token_peer == (rank % NODE_SIZE)) {
+                        dst_base = recv_buffer;
+                    } else if constexpr (NODE_SIZE > 1) {
                         dst_base = recv_ptrs_local[token_peer];
                     } else {
                         dst_base = recv_buffer;
@@ -240,6 +290,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_send_ker
         shared_to_local(num_recv_tokens);
     }
 
+    __threadfence_system();
     grid.sync();
 
     if (blockIdx.x == 0) {

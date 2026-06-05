@@ -24,6 +24,8 @@ void a2a_dispatch_recv_kernel(
     size_t x_elemsize,
     size_t x_scale_elemsize,
     size_t num_experts,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t world_size,
@@ -101,6 +103,11 @@ void a2a_dispatch_recv_kernel(
     const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size / dp_size);
     const size_t first_expert = (rank / dp_size) * experts_per_rank;
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
+    const size_t num_local_experts = last_expert - first_expert;
+    const bool use_rect_transport_recv = num_max_dispatch_tokens_per_rank > 0
+        && dp_size == 1
+        && world_size == NODE_SIZE
+        && num_local_experts * num_max_dispatch_tokens_per_rank <= max_private_tokens;
 
     // Wait for NVLink transfers to complete.
     auto counter = *sync_counter;
@@ -122,6 +129,95 @@ void a2a_dispatch_recv_kernel(
     // Wait for the worker to indicate the number of tokens received.
     const unsigned num_recv_tokens = ld_volatile_u32(num_recv_tokens_ptr);
     const unsigned num_efa_tokens = ld_volatile_u32(num_recv_tokens_ptr + 1);
+
+    if (use_rect_transport_recv) {
+        const size_t max_tokens_per_expert = num_max_dispatch_tokens_per_rank * (world_size / dp_size);
+        const size_t dp_group = rank / dp_size;
+        const size_t groups_per_node = NODE_SIZE / dp_size;
+        const size_t slots_per_source_group = num_local_experts * num_max_dispatch_tokens_per_rank;
+        const size_t total_rect_slots = (world_size / dp_size) * slots_per_source_group;
+
+        for (size_t linear = blockIdx.x; linear < total_rect_slots; linear += gridDim.x) {
+            const size_t source_group = linear / slots_per_source_group;
+            const size_t local_slot = linear - source_group * slots_per_source_group;
+            const size_t local_expert = local_slot / num_max_dispatch_tokens_per_rank;
+            const size_t token_in_source_expert = local_slot - local_expert * num_max_dispatch_tokens_per_rank;
+            const size_t expert = first_expert + local_expert;
+            const uint32_t source_count = __ldg(num_routed + source_group * num_experts + expert);
+            if (token_in_source_expert >= source_count) {
+                continue;
+            }
+
+            uint32_t source_group_offset = 0;
+            for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                if (ordered_group == source_group) {
+                    break;
+                }
+                source_group_offset += __ldg(num_routed + ordered_group * num_experts + expert);
+            }
+            const uint32_t source_rank_value = source_group * dp_size + (rank % dp_size);
+            const uint32_t dst_index = local_expert * max_tokens_per_expert
+                + source_group_offset
+                + token_in_source_expert;
+            const uint32_t src_index = source_group * max_private_tokens
+                + local_expert * num_max_dispatch_tokens_per_rank
+                + token_in_source_expert;
+
+            std::byte *src_base = source_rank_value == rank ? send_buffer : recv_buffer;
+            uint4 *x_token_src = (uint4*)(src_base + src_index * token_stride);
+            uint4 *x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
+            float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
+            float *x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+
+            auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+            if (threadIdx.x == 0) {
+                source_rank_by_final_index[dst_index] = source_rank_value;
+                source_token_index[dst_index] = source_route_info[0];
+                source_route_index[dst_index] = source_route_info[1];
+                source_expert_index[dst_index] = source_route_info[2];
+            }
+
+            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
+                const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
+                auto val = ld_global_nc_uint4(&x_token_src[i]);
+                st_global_nc_uint4(&x_token_dst[i], val);
+                if (has_scale) {
+                    x_scale_dst[i * out_x_scale_stride_elem] = x_scale_src[i];
+                }
+            }
+        }
+
+        if (blockIdx.x == 0) {
+            for (unsigned expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
+                out_num_tokens_ptr[expert] = tokens_per_expert[expert];
+            }
+        }
+
+        grid.sync();
+
+        // Match the normal dispatch-recv path's NVLink barrier. Combine-send
+        // waits on this before reusing the per-slot send/recv buffers.
+        if constexpr (NODE_SIZE > 1) {
+            if (blockIdx.x == 0) {
+                if (threadIdx.x == 0) {
+                    *sync_counter = counter + 1;
+                }
+                auto local_rank = rank % NODE_SIZE;
+                for (unsigned peer = threadIdx.x; peer < NODE_SIZE; peer += blockDim.x) {
+                    st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
+                }
+            }
+            grid.sync();
+        }
+
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            __threadfence_system();
+            st_mmio_u32(dispatch_recv_done, epoch);
+            *dispatch_recv_flag = 0;
+        }
+        return;
+    }
 
     // Pre-populate token information into the pipeline.
     auto next_token = blockIdx.x + threadIdx.x * gridDim.x;
@@ -260,6 +356,7 @@ void a2a_dispatch_recv_kernel(
     grid.sync();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
         st_mmio_u32(dispatch_recv_done, epoch);
         // Reset the state.
         *dispatch_recv_flag = 0;
@@ -274,6 +371,8 @@ int a2a_kernels::a2a_dispatch_recv(
     size_t x_elemsize,
     size_t x_scale_elemsize,
     size_t num_experts,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
     size_t rank,
     size_t dp_size,
     size_t node_size,
@@ -325,6 +424,8 @@ int a2a_kernels::a2a_dispatch_recv(
         &x_elemsize,
         &x_scale_elemsize,
         &num_experts,
+        &max_private_tokens,
+        &num_max_dispatch_tokens_per_rank,
         &rank,
         &dp_size,
         &world_size,

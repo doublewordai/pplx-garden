@@ -152,7 +152,6 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
     if (blockIdx.x == 0) {
         if (warp_id == 0) {
             if (elect_one_sync()) {
-                st_mmio_u32(combine_recv_done, epoch);
                 *combine_recv_flag = 0;
                 *sync_counter = counter + 1;
             }
@@ -162,6 +161,11 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_combine_recv_ker
             if (peer < NODE_SIZE) {
                 st_volatile_u32(&sync_ptrs[peer][local_rank], counter + 1);
             }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            st_mmio_u32(combine_recv_done, epoch);
         }
     }
 }

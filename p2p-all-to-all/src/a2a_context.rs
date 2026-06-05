@@ -91,6 +91,14 @@ struct DeviceWorkspace {
     token_offset: CudaDeviceMemory,
     /// Source-rank local `(token, topk)` to combine receive-buffer position.
     combine_recv_position: CudaDeviceMemory,
+    /// Source rank for each final BatchedExperts row.
+    source_rank_by_final_index: CudaDeviceMemory,
+    /// Original source token for each final BatchedExperts row.
+    source_token_index: CudaDeviceMemory,
+    /// Original source top-k route for each final BatchedExperts row.
+    source_route_index: CudaDeviceMemory,
+    /// Global source expert for each final BatchedExperts row.
+    source_expert_index: CudaDeviceMemory,
     /// Counter for the number of tokens sent during combine.
     token_counter: CudaDeviceMemory,
     /// Completion counter for dispatch-send.
@@ -124,6 +132,7 @@ impl DeviceWorkspace {
         num_experts: usize,
         max_num_tokens: usize,
         num_experts_per_token: usize,
+        max_final_slots: usize,
         host_sync_ptrs: &[u64],
         host_send_ptrs: &[u64],
         host_recv_ptrs: &[u64],
@@ -138,6 +147,14 @@ impl DeviceWorkspace {
         let combine_recv_position = CudaDeviceMemory::device(
             max_num_tokens * num_experts_per_token * std::mem::size_of::<u32>(),
         )?;
+        let source_rank_by_final_index =
+            CudaDeviceMemory::device(max_final_slots * std::mem::size_of::<u32>())?;
+        let source_token_index =
+            CudaDeviceMemory::device(max_final_slots * std::mem::size_of::<u32>())?;
+        let source_route_index =
+            CudaDeviceMemory::device(max_final_slots * std::mem::size_of::<u32>())?;
+        let source_expert_index =
+            CudaDeviceMemory::device(max_final_slots * std::mem::size_of::<u32>())?;
 
         let token_counter = CudaDeviceMemory::device(std::mem::size_of::<u32>())?;
         token_counter.zero();
@@ -174,6 +191,10 @@ impl DeviceWorkspace {
             expert_offsets,
             token_offset,
             combine_recv_position,
+            source_rank_by_final_index,
+            source_token_index,
+            source_route_index,
+            source_expert_index,
             token_counter,
             dispatch_send_counter,
             dispatch_recv_counter,
@@ -382,6 +403,13 @@ impl AllToAllContext {
         let mut workers = Vec::with_capacity(num_slots);
         let mut threads = Vec::with_capacity(num_slots);
         let mut workspaces = Vec::with_capacity(num_slots);
+        let num_ep_groups = world_size / dp_size;
+        let num_local_experts = num_experts.div_ceil(num_ep_groups);
+        let max_final_slots = if max_tokens_per_expert > 0 {
+            num_local_experts * max_tokens_per_expert
+        } else {
+            max_recv_tokens
+        };
 
         for slot_idx in 0..num_slots {
             cudaSetDevice(device.into())?;
@@ -389,6 +417,7 @@ impl AllToAllContext {
                 num_experts,
                 max_num_tokens,
                 num_experts_per_token,
+                max_final_slots,
                 &sync_ptrs[slot_idx],
                 &send_ptrs[slot_idx],
                 &recv_ptrs[slot_idx],
@@ -536,6 +565,12 @@ impl AllToAllContext {
 
     fn worker(&self, slot: usize) -> Result<&Arc<WorkerState>> {
         self.workers
+            .get(slot)
+            .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
+    }
+
+    fn workspace(&self, slot: usize) -> Result<&DeviceWorkspace> {
+        self.workspaces
             .get(slot)
             .ok_or_else(|| anyhow!("Invalid all-to-all slot {}", slot))
     }
@@ -1032,6 +1067,12 @@ impl AllToAllContext {
         let dp_size = self.dp_size;
         let node_size = self.node_size;
         let world_size = self.world_size;
+        let max_private_tokens = self.max_private_tokens;
+        let num_max_dispatch_tokens_per_rank = if self.max_tokens_per_expert > 0 {
+            self.max_tokens_per_expert / (world_size / dp_size)
+        } else {
+            0
+        };
         let worker = self.worker(slot)?.clone();
         let workspace = self.workspace_mut(slot)?;
 
@@ -1042,6 +1083,8 @@ impl AllToAllContext {
             in_elemsize,
             scale_elemsize,
             num_experts,
+            max_private_tokens,
+            num_max_dispatch_tokens_per_rank,
             rank,
             dp_size,
             node_size,
@@ -1058,10 +1101,10 @@ impl AllToAllContext {
             worker.slot.source_rank.get_device_ptr(),
             worker.slot.source_dispatch_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
-            worker.slot.source_rank_by_final_index.get_device_ptr(),
-            worker.slot.source_token_index.get_device_ptr(),
-            worker.slot.source_route_index.get_device_ptr(),
-            worker.slot.source_expert_index.get_device_ptr(),
+            workspace.source_rank_by_final_index.get_mut_ptr(),
+            workspace.source_token_index.get_mut_ptr(),
+            workspace.source_route_index.get_mut_ptr(),
+            workspace.source_expert_index.get_mut_ptr(),
             worker.buffers.num_routed_ptr,
             worker.slot.num_recv_tokens.get_device_ptr(),
             worker.slot.num_recv_tokens_ready.get_device_ptr(),
@@ -1130,7 +1173,7 @@ impl AllToAllContext {
             worker.slot.tx_ready.get_device_ptr(),
             worker.buffers.send_buffer_ptr as *mut u8,
             worker.buffers.recv_buffer_ptr as *mut u8,
-            worker.slot.source_rank_by_final_index.get_device_ptr(),
+            workspace.source_rank_by_final_index.get_mut_ptr(),
             worker.slot.combine_send_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
             worker.slot.num_recv_tokens.get_device_ptr(),
@@ -1502,26 +1545,62 @@ impl AllToAllContext {
                 num_ep_groups,
                 self.num_experts.div_ceil(num_ep_groups),
             );
+        let workspace = self.workspace(slot)?;
+        let max_final_slots = if self.max_tokens_per_expert > 0 {
+            self.num_experts.div_ceil(num_ep_groups) * self.max_tokens_per_expert
+        } else {
+            self.max_recv_tokens
+        };
+        let source_rank_by_final_index = workspace
+            .source_rank_by_final_index
+            .to_vec::<u32>(max_final_slots)
+            .map_err(|e| {
+                anyhow!("copy source_rank_by_final_index for debug route plan: {e}")
+            })?;
+        let source_token_index =
+            workspace.source_token_index.to_vec::<u32>(max_final_slots).map_err(
+                |e| anyhow!("copy source_token_index for debug route plan: {e}"),
+            )?;
+        let source_route_index =
+            workspace.source_route_index.to_vec::<u32>(max_final_slots).map_err(
+                |e| anyhow!("copy source_route_index for debug route plan: {e}"),
+            )?;
+        let source_expert_index =
+            workspace.source_expert_index.to_vec::<u32>(max_final_slots).map_err(
+                |e| anyhow!("copy source_expert_index for debug route plan: {e}"),
+            )?;
         plan.source_rank_by_final_index = plan
             .final_index
             .iter()
-            .map(|index| worker.slot.source_rank_by_final_index.get(*index as usize))
+            .map(|index| source_rank_by_final_index[*index as usize])
             .collect();
         plan.source_token_index = plan
             .final_index
             .iter()
-            .map(|index| worker.slot.source_token_index.get(*index as usize))
+            .map(|index| source_token_index[*index as usize])
             .collect();
         plan.source_route_index = plan
             .final_index
             .iter()
-            .map(|index| worker.slot.source_route_index.get(*index as usize))
+            .map(|index| source_route_index[*index as usize])
             .collect();
         plan.source_expert_index = plan
             .final_index
             .iter()
-            .map(|index| worker.slot.source_expert_index.get(*index as usize))
+            .map(|index| source_expert_index[*index as usize])
             .collect();
+        plan.combine_send_offset = plan
+            .final_index
+            .iter()
+            .enumerate()
+            .map(|(route_index, _)| worker.slot.combine_send_offset.get(route_index))
+            .collect();
+        plan.combine_recv_position = workspace
+            .combine_recv_position
+            .to_vec(self.max_num_tokens * self.num_experts_per_token)
+            .map_err(|e| {
+                anyhow!("copy combine_recv_position for debug route plan: {e}")
+            })?;
         Ok(plan)
     }
 }

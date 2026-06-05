@@ -183,6 +183,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     const size_t experts_per_rank = ceil_div<size_t>(num_experts, expert_parallel_size);
     const size_t first_expert = (rank / dp_size) * experts_per_rank;
     const size_t last_expert = min<size_t>(first_expert + experts_per_rank, num_experts);
+    const bool use_rect_private_self = dp_size == 1 && world_size == NODE_SIZE;
 
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
     auto store_source_route_info = [&](std::byte *token_ptr, uint32_t token, uint32_t route, uint32_t expert) {
@@ -212,6 +213,17 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
     };
     auto can_use_private_recv = [&](const ExpertAndOffset& route) {
         return private_recv_offset(route) < (node_group + 1) * max_private_tokens;
+    };
+    auto use_private_recv = [&](uint32_t dst_rank, uint32_t dst_node, const ExpertAndOffset& route) {
+        return dst_node == node_rank
+            && can_use_private_recv(route)
+            && (dst_rank != rank || use_rect_private_self);
+    };
+    auto private_recv_base = [&](uint32_t dst_rank) {
+        if (dst_rank == rank) {
+            return send_buffer;
+        }
+        return recv_ptrs[dst_rank % NODE_SIZE];
     };
 
     // In the first phase, count how many tokens are sent to each other rank
@@ -349,11 +361,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
-                        if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
+                        if (use_private_recv(dst_rank, dst_node, route)) {
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
-                                const uint32_t local_peer = dst_rank % NODE_SIZE;
-                                std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
+                                std::byte *token_ptr = private_recv_base(dst_rank) + private_recv_offset(route) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 store_source_route_info(token_ptr, token, e, route.expert);
                                 st_global_nc_uint4(&x_token_dst[i], val);
@@ -398,7 +409,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node != node_rank || dst_rank == rank || !can_use_private_recv(route)) {
+                    if (!use_private_recv(dst_rank, dst_node, route)) {
                         // Always write into the send buffer for local copies.
                         std::byte *token_ptr = send_buffer + route.position * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
@@ -425,10 +436,9 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
+                    if (use_private_recv(dst_rank, dst_node, route)) {
                         // Write to the private recv buffer directly using NVLink.
-                        const uint32_t local_peer = dst_rank % NODE_SIZE;
-                        std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
+                        std::byte *token_ptr = private_recv_base(dst_rank) + private_recv_offset(route) * token_stride;
                         uint4 *x_token_dst = (uint4*)token_ptr;
                         store_source_route_info(token_ptr, token, e, route.expert);
                         for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
@@ -485,7 +495,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                     const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                     // If the destination is within the same node, write using NVLink.
-                    if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
+                    if (use_private_recv(dst_rank, dst_node, route)) {
                         continue;
                     } else {
                         // Always write into the send buffer for local copies.
@@ -538,11 +548,10 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_ke
                         const uint32_t dst_node = dst_rank / NODE_SIZE;
 
                         // If the destination is within the same node, write using NVLink.
-                        if (dst_node == node_rank && dst_rank != rank && can_use_private_recv(route)) {
+                        if (use_private_recv(dst_rank, dst_node, route)) {
                             if (dst_rank % dp_size == rank % dp_size) {
                                 // Write to the private recv buffer directly using NVLink.
-                                const uint32_t local_peer = dst_rank % NODE_SIZE;
-                                std::byte *token_ptr = recv_ptrs[local_peer] + private_recv_offset(route) * token_stride;
+                                std::byte *token_ptr = private_recv_base(dst_rank) + private_recv_offset(route) * token_stride;
                                 uint4 *x_token_dst = (uint4*)token_ptr;
                                 store_source_route_info(token_ptr, token, e, route.expert);
                                 st_global_nc_uint4(&x_token_dst[i], val);

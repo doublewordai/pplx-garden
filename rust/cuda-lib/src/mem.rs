@@ -84,6 +84,24 @@ impl CudaDeviceMemory {
             )
         }
     }
+
+    pub fn to_vec<T: Copy + Default>(&self, len: usize) -> Result<Vec<T>, CudartError> {
+        let size = len * std::mem::size_of::<T>();
+        assert!(size <= self.size);
+        let mut data = vec![T::default(); len];
+        let ret = unsafe {
+            cudart_sys::cudaMemcpy(
+                data.as_mut_ptr() as *mut c_void,
+                self.ptr.as_ptr(),
+                size,
+                cudart_sys::cudaMemcpyDeviceToHost,
+            )
+        };
+        if ret != cudart_sys::cudaSuccess {
+            return Err(CudartError::new(ret, "cudaMemcpyDeviceToHost"));
+        }
+        Ok(data)
+    }
 }
 
 impl Drop for CudaDeviceMemory {

@@ -383,13 +383,16 @@ def _test_p2p_all_to_all_worker(
                 world_size=global_group.size,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
-            if native_route_plan != expected_route_plan:
+            comparable_native_route_plan = {
+                key: native_route_plan[key] for key in expected_route_plan
+            }
+            if comparable_native_route_plan != expected_route_plan:
                 for key in sorted(expected_route_plan):
                     if native_route_plan.get(key) != expected_route_plan.get(key):
                         print(f"route plan mismatch for {key}")
                         print("native:", native_route_plan.get(key))
                         print("expected:", expected_route_plan.get(key))
-                assert native_route_plan == expected_route_plan
+                assert comparable_native_route_plan == expected_route_plan
 
             (
                 ll_expert_x_interleaved,
@@ -433,10 +436,13 @@ def _test_p2p_all_to_all_worker(
                 expert_padding=config.expert_padding,
                 max_tokens_per_expert=config.max_tokens_per_expert,
             )
-            assert (
+            interleaved_route_plan = (
                 ll_dispatch_handle_interleaved.debug_route_layout_plan()
-                == expected_route_plan
             )
+            comparable_interleaved_route_plan = {
+                key: interleaved_route_plan[key] for key in expected_route_plan
+            }
+            assert comparable_interleaved_route_plan == expected_route_plan
 
             if ll_expert_x.dtype == out_dtype:
                 ll_combine_buffer = (
@@ -512,10 +518,13 @@ def _test_p2p_all_to_all_worker(
                 config.max_tokens_per_expert,
                 hidden_dim,
             )
+            interleaved_route_plan_for_combine = (
+                ll_dispatch_handle_interleaved.debug_route_layout_plan()
+            )
             metadata_ref_out_tokens_interleaved = (
                 expected_combine_from_route_metadata(
                     expert_y=ll_expert_y_interleaved,
-                    route_plan=ll_dispatch_handle_interleaved.debug_route_layout_plan(),
+                    route_plan=interleaved_route_plan_for_combine,
                     rank_data=rank_data,
                     rank=global_group.rank,
                     dp_size=tp_group.size,
