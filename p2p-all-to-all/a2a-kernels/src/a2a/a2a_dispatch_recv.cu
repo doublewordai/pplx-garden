@@ -54,7 +54,8 @@ void a2a_dispatch_recv_kernel(
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
     std::byte **send_ptrs,
-    uint32_t * __restrict__ current_epoch
+    uint32_t * __restrict__ current_epoch,
+    bool skip_rect_payload_copy
 ) {
     TokenDimTy token_dim_bound(token_dim);
     HiddenDimScaleTy hidden_dim_scale_bound(hidden_dim_scale);
@@ -165,12 +166,9 @@ void a2a_dispatch_recv_kernel(
                 + token_in_source_expert;
 
             std::byte *src_base = source_rank_value == rank ? send_buffer : recv_buffer;
-            uint4 *x_token_src = (uint4*)(src_base + src_index * token_stride);
-            uint4 *x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
-            float *x_scale_src = (float*)((std::byte*)x_token_src + token_dim);
-            float *x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+            std::byte *metadata_token = src_base + src_index * token_stride;
 
-            auto *source_route_info = (uint32_t*)((std::byte*)x_token_src + token_dim_bound + token_scale_dim);
+            auto *source_route_info = (uint32_t*)(metadata_token + token_dim_bound + token_scale_dim);
             if (threadIdx.x == 0) {
                 source_rank_by_final_index[dst_index] = source_rank_value;
                 source_token_index[dst_index] = source_route_info[0];
@@ -178,12 +176,19 @@ void a2a_dispatch_recv_kernel(
                 source_expert_index[dst_index] = source_route_info[2];
             }
 
-            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
-                const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
-                auto val = ld_global_nc_uint4(&x_token_src[i]);
-                st_global_nc_uint4(&x_token_dst[i], val);
-                if (has_scale) {
-                    x_scale_dst[i * out_x_scale_stride_elem] = x_scale_src[i];
+            if (!skip_rect_payload_copy) {
+                uint4 *x_token_src = (uint4*)metadata_token;
+                uint4 *x_token_dst = (uint4*)(out_x_ptr + dst_index * out_x_stride);
+                float *x_scale_src = (float*)(metadata_token + token_dim);
+                float *x_scale_dst = (float*)(out_x_scale_ptr + dst_index * out_x_scale_stride_token);
+
+                for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += blockDim.x) {
+                    const bool has_scale = out_x_scale_ptr && i < hidden_dim_scale_bound;
+                    auto val = ld_global_nc_uint4(&x_token_src[i]);
+                    st_global_nc_uint4(&x_token_dst[i], val);
+                    if (has_scale) {
+                        x_scale_dst[i * out_x_scale_stride_elem] = x_scale_src[i];
+                    }
                 }
             }
         }
@@ -403,6 +408,7 @@ int a2a_kernels::a2a_dispatch_recv(
     uint32_t **sync_ptrs,
     uint8_t **send_ptrs,
     uint32_t *current_epoch,
+    bool skip_rect_payload_copy,
     uint64_t stream
 ) {
     constexpr size_t NUM_WARPS = 16;
@@ -455,6 +461,7 @@ int a2a_kernels::a2a_dispatch_recv(
         &sync_ptrs,
         &send_ptrs,
         &current_epoch,
+        &skip_rect_payload_copy,
     };
 
     nvtxRangePush("dispatch_recv");

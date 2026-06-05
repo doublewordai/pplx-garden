@@ -103,6 +103,9 @@ mod ffi {
             sync_counter: *mut u32,
             sync_ptrs: *mut *mut u32,
             recv_ptrs: *mut *mut u8,
+            expert_x_ptrs: *mut *mut u8,
+            expert_x_scale_ptrs: *mut *mut u8,
+            num_recv_tokens_ready: *mut u32,
             epoch_counter: *mut u32,
             current_epoch: *mut u32,
             stream: u64,
@@ -147,6 +150,7 @@ mod ffi {
             sync_ptrs: *mut *mut u32,
             send_ptrs: *mut *mut u8,
             current_epoch: *mut u32,
+            skip_rect_payload_copy: bool,
             stream: u64,
         ) -> i32;
 

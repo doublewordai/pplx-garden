@@ -173,6 +173,7 @@ impl PyAllToAllContext {
         weights_ptr: u64,
         weights_stride: usize,
         bound_m_ptr: Option<u64>,
+        direct_to_low_latency_workspace: Option<bool>,
         stream: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
         let handle = self
@@ -189,6 +190,7 @@ impl PyAllToAllContext {
                 weights_ptr as *const f32,
                 weights_stride,
                 bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
+                direct_to_low_latency_workspace.unwrap_or(false),
                 stream,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -214,6 +216,7 @@ impl PyAllToAllContext {
         weights_ptr: u64,
         weights_stride: usize,
         bound_m_ptr: Option<u64>,
+        direct_to_low_latency_workspace: Option<bool>,
         stream: u64,
     ) -> PyResult<Bound<'py, PyDict>> {
         let handle = self
@@ -231,6 +234,7 @@ impl PyAllToAllContext {
                 weights_ptr as *const f32,
                 weights_stride,
                 bound_m_ptr.map(|ptr| ptr as *const i32).unwrap_or(null()),
+                direct_to_low_latency_workspace.unwrap_or(false),
                 stream,
             )
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

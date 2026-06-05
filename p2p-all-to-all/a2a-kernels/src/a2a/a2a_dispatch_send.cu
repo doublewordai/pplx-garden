@@ -723,17 +723,21 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
     const int32_t * __restrict__ bound_m_ptr,
     const std::byte * __restrict__ x_ptr,
     size_t x_stride,
-    const std::byte * __restrict__ x_scale_ptr,
+    const float * __restrict__ x_scale_ptr,
     size_t x_scale_stride_elem,
     size_t x_scale_stride_token,
     const int32_t * __restrict__ indices,
     size_t indices_stride,
     const uint32_t * __restrict__ token_offset,
+    const uint32_t * __restrict__ num_routed,
     uint32_t * __restrict__ dispatch_send_done,
     std::byte * __restrict__ send_buffer,
     uint32_t * __restrict__ sync_counter,
     uint32_t ** __restrict__ sync_ptrs,
     std::byte ** __restrict__ recv_ptrs,
+    std::byte ** __restrict__ expert_x_ptrs,
+    std::byte ** __restrict__ expert_x_scale_ptrs,
+    uint32_t * __restrict__ num_recv_tokens_ready,
     uint32_t * __restrict__ current_epoch
 ) {
     auto grid = cooperative_groups::this_grid();
@@ -744,6 +748,12 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
     const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
     const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
     const size_t source_group = rank;
+    const uint32_t epoch = *current_epoch;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        while (ld_mmio_u32(num_recv_tokens_ready) != epoch);
+    }
+    grid.sync();
 
     auto store_source_route_info = [&](std::byte *token_ptr, uint32_t token, uint32_t route, uint32_t expert) {
         if (lane_id == 0) {
@@ -768,10 +778,21 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
             + local_expert * num_max_dispatch_tokens_per_rank
             + slot;
         std::byte *dst_base = dst_rank == rank ? send_buffer : recv_ptrs[dst_rank % node_size];
-        std::byte *token_ptr = dst_base + rect_offset * token_stride;
+        std::byte *meta_token_ptr = dst_base + rect_offset * token_stride;
+        uint32_t source_group_offset = 0;
+        for (uint32_t offset = 1; offset < node_size; ++offset) {
+            const uint32_t ordered_group = (dst_rank + offset) % node_size;
+            if (ordered_group == source_group) {
+                break;
+            }
+            source_group_offset += __ldg(num_routed + ordered_group * num_experts + expert);
+        }
+        const uint32_t max_tokens_per_expert = num_max_dispatch_tokens_per_rank * world_size;
+        const uint32_t final_index = local_expert * max_tokens_per_expert + source_group_offset + slot;
+        std::byte *token_ptr = expert_x_ptrs[dst_rank % node_size] + final_index * token_dim;
         uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
         uint4 *x_token_dst = (uint4*)token_ptr;
-        store_source_route_info(token_ptr, token, route, expert);
+        store_source_route_info(meta_token_ptr, token, route, expert);
 
         const uint32_t token_int4 = token_dim / sizeof(uint4);
         for (uint32_t i = lane_id; i < token_int4; i += WARP_SIZE) {
@@ -779,9 +800,10 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
             st_global_nc_uint4(&x_token_dst[i], val);
         }
 
-        if (x_scale_ptr) {
-            const float *x_scale_src = (const float*)(x_scale_ptr + token * x_scale_stride_token);
-            float *x_scale_dst = (float*)(token_ptr + token_dim);
+        if (x_scale_ptr && expert_x_scale_ptrs) {
+            const float *x_scale_src = x_scale_ptr + token * x_scale_stride_token;
+            float *x_scale_dst = (float*)(expert_x_scale_ptrs[dst_rank % node_size]
+                + final_index * hidden_dim_scale * sizeof(float));
             for (uint32_t i = lane_id; i < hidden_dim_scale; i += WARP_SIZE) {
                 x_scale_dst[i] = *(float*)(x_scale_src + i * x_scale_stride_elem);
             }
@@ -837,6 +859,9 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint8_t **expert_x_ptrs,
+    uint8_t **expert_x_scale_ptrs,
+    uint32_t *num_recv_tokens_ready,
     uint32_t *epoch_counter,
     uint32_t *current_epoch,
     uint64_t stream
@@ -912,11 +937,15 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
         &indices,
         &indices_stride,
         &token_offset,
+        &num_routed,
         &dispatch_send_done,
         &send_buffer,
         &sync_counter,
         &sync_ptrs,
         &recv_ptrs,
+        &expert_x_ptrs,
+        &expert_x_scale_ptrs,
+        &num_recv_tokens_ready,
         &current_epoch,
     };
 

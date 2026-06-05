@@ -109,6 +109,9 @@ int a2a_dispatch_send_node_rect(
     uint32_t *sync_counter,
     uint32_t **sync_ptrs,
     uint8_t **recv_ptrs,
+    uint8_t **expert_x_ptrs,
+    uint8_t **expert_x_scale_ptrs,
+    uint32_t *num_recv_tokens_ready,
     uint32_t *epoch_counter,
     uint32_t *current_epoch,
     uint64_t stream
@@ -153,6 +156,7 @@ int a2a_dispatch_recv(
     uint32_t **sync_ptrs,
     uint8_t **send_ptrs,
     uint32_t *current_epoch,
+    bool skip_rect_payload_copy,
     uint64_t stream
 );
 

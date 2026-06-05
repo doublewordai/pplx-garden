@@ -798,6 +798,7 @@ pub(crate) struct WorkerState {
     combine_counter: ImmCounter,
     dispatch_barrier_counter: ImmCounter,
     combine_barrier_counter: ImmCounter,
+    direct_node_dispatch: AtomicBool,
     tx_counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
     route_write_op: TransferRequest,
@@ -996,6 +997,7 @@ impl WorkerState {
             combine_counter,
             dispatch_barrier_counter,
             combine_barrier_counter,
+            direct_node_dispatch: AtomicBool::new(false),
             tx_counter: Arc::new(AtomicI64::new(0)),
             err_counter: Arc::new(AtomicI64::new(0)),
             route_write_op,
@@ -1130,6 +1132,32 @@ impl WorkerState {
         self.epoch.load(Ordering::Acquire)
     }
 
+    pub(crate) fn set_direct_node_dispatch(&self, enabled: bool) {
+        self.direct_node_dispatch.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn direct_node_dispatch_enabled(&self) -> bool {
+        self.direct_node_dispatch.load(Ordering::Acquire)
+    }
+
+    fn uses_single_node_direct_dispatch(&self) -> bool {
+        if !self.direct_node_dispatch_enabled() {
+            return false;
+        }
+        let num_ep_groups = self.world_size / self.dp_size;
+        let num_max_dispatch_tokens_per_rank = if self.max_tokens_per_expert > 0 {
+            self.max_tokens_per_expert / num_ep_groups
+        } else {
+            0
+        };
+        let num_local_experts = self.num_experts.div_ceil(num_ep_groups);
+        self.dp_size == 1
+            && self.world_size == self.node_size
+            && num_max_dispatch_tokens_per_rank > 0
+            && num_local_experts * num_max_dispatch_tokens_per_rank
+                <= self.max_private_tokens
+    }
+
     fn wait_epoch(&self, flag: &GdrEpoch, epoch: u32) -> bool {
         flag.wait_for(epoch, || self.is_running())
     }
@@ -1203,33 +1231,42 @@ impl WorkerState {
                 .unwrap();
         }
 
-        // Wait for the dispatch kernel to copy tokens into send buffers.
-        let wait_dispatch_send_start = Instant::now();
-        if !self.wait_epoch_trace(
-            "dispatch_send_done",
-            &self.slot.dispatch_send_done,
-            epoch,
-            trace,
-        ) {
-            return;
-        }
-        Self::add_elapsed_ns(
-            &self.accumulated_wait_dispatch_send_ns,
-            wait_dispatch_send_start,
-        );
-        self.slot.tx_ready.set(false);
-        if trace {
-            eprintln!(
-                "PPLX worker rank={} slot={} epoch={} dispatch_send_done observed; tx_ready cleared",
-                self.rank, self.slot_idx, epoch
+        let direct_node_dispatch = self.uses_single_node_direct_dispatch();
+
+        if !direct_node_dispatch {
+            // Wait for the dispatch kernel to copy tokens into send buffers
+            // before fabric payload transfers consume those buffers.
+            let wait_dispatch_send_start = Instant::now();
+            if !self.wait_epoch_trace(
+                "dispatch_send_done",
+                &self.slot.dispatch_send_done,
+                epoch,
+                trace,
+            ) {
+                return;
+            }
+            Self::add_elapsed_ns(
+                &self.accumulated_wait_dispatch_send_ns,
+                wait_dispatch_send_start,
             );
+            self.slot.tx_ready.set(false);
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} dispatch_send_done observed; tx_ready cleared",
+                    self.rank, self.slot_idx, epoch
+                );
+            }
         }
         if !self.is_running() {
             return;
         }
 
         // Trigger transfers into private recv buffers.
-        let num_private_ranges = self.dispatch_initial_routes();
+        let num_private_ranges = if direct_node_dispatch {
+            0
+        } else {
+            self.dispatch_initial_routes()
+        };
         if trace {
             eprintln!(
                 "PPLX worker rank={} slot={} epoch={} dispatch_initial_routes num_private_ranges={}",
@@ -1278,6 +1315,33 @@ impl WorkerState {
                 route.dispatch_ranges.len(),
                 route.combine_ranges.len()
             );
+        }
+
+        if direct_node_dispatch {
+            // The direct single-node path needs destination-side route layout
+            // before it writes into final BatchedExperts storage. The copy
+            // kernel waits on num_recv_tokens_ready, then publishes
+            // dispatch_send_done.
+            let wait_dispatch_send_start = Instant::now();
+            if !self.wait_epoch_trace(
+                "dispatch_send_done",
+                &self.slot.dispatch_send_done,
+                epoch,
+                trace,
+            ) {
+                return;
+            }
+            Self::add_elapsed_ns(
+                &self.accumulated_wait_dispatch_send_ns,
+                wait_dispatch_send_start,
+            );
+            self.slot.tx_ready.set(false);
+            if trace {
+                eprintln!(
+                    "PPLX worker rank={} slot={} epoch={} direct dispatch_send_done observed; tx_ready cleared",
+                    self.rank, self.slot_idx, epoch
+                );
+            }
         }
 
         // Register a callback to wait for the expected number of immediates.
