@@ -629,6 +629,7 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_no
 
     auto grid = cooperative_groups::this_grid();
     constexpr size_t NUM_THREADS = NUM_WARPS * WARP_SIZE;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
     const size_t lane_id = get_lane_id();
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -703,99 +704,101 @@ __global__ __launch_bounds__(NUM_WARPS * WARP_SIZE, 1) void a2a_dispatch_send_no
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         *sync_counter = counter + 1;
     }
+}
+
+
+__global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect_copy_kernel(
+    const size_t token_dim,
+    const size_t token_scale_dim,
+    const size_t token_stride,
+    size_t hidden_dim_scale,
+    size_t num_experts,
+    size_t num_experts_per_token,
+    size_t max_private_tokens,
+    size_t num_max_dispatch_tokens_per_rank,
+    size_t rank,
+    size_t node_size,
+    size_t world_size,
+    size_t num_tokens,
+    const int32_t * __restrict__ bound_m_ptr,
+    const std::byte * __restrict__ x_ptr,
+    size_t x_stride,
+    const std::byte * __restrict__ x_scale_ptr,
+    size_t x_scale_stride_elem,
+    size_t x_scale_stride_token,
+    const int32_t * __restrict__ indices,
+    size_t indices_stride,
+    const uint32_t * __restrict__ token_offset,
+    uint32_t * __restrict__ dispatch_send_done,
+    std::byte * __restrict__ send_buffer,
+    uint32_t * __restrict__ sync_counter,
+    uint32_t ** __restrict__ sync_ptrs,
+    std::byte ** __restrict__ recv_ptrs,
+    uint32_t * __restrict__ current_epoch
+) {
+    auto grid = cooperative_groups::this_grid();
+    constexpr size_t NUM_WARPS = 16;
+    const size_t warp_id = threadIdx.x / WARP_SIZE;
+    const size_t lane_id = get_lane_id();
+
+    const size_t num_send_tokens = bound_m_ptr ? *bound_m_ptr : num_tokens;
+    const size_t experts_per_rank = ceil_div<size_t>(num_experts, world_size);
+    const size_t source_group = rank;
 
     auto store_source_route_info = [&](std::byte *token_ptr, uint32_t token, uint32_t route, uint32_t expert) {
-        if (threadIdx.x == 0) {
-            auto *source_token_index = reinterpret_cast<uint32_t*>(token_ptr + token_dim_bound + token_scale_dim);
+        if (lane_id == 0) {
+            auto *source_token_index = reinterpret_cast<uint32_t*>(token_ptr + token_dim + token_scale_dim);
             *source_token_index = token;
             source_token_index[1] = route;
             source_token_index[2] = expert;
         }
     };
 
-    for (uint32_t token = blockIdx.x; token < num_send_tokens; token += gridDim.x) {
+    const uint32_t num_route_warps = gridDim.x * NUM_WARPS;
+    for (uint32_t route_linear = blockIdx.x * NUM_WARPS + warp_id;
+         route_linear < num_send_tokens * num_experts_per_token;
+         route_linear += num_route_warps) {
+        const uint32_t token = route_linear / num_experts_per_token;
+        const uint32_t route = route_linear - token * num_experts_per_token;
+        const uint32_t expert = __ldg(&indices[token * indices_stride + route]);
+        const uint32_t dst_rank = expert / experts_per_rank;
+        const uint32_t local_expert = expert - dst_rank * experts_per_rank;
+        const uint32_t slot = token_offset[token * num_experts_per_token + route];
+        const uint32_t rect_offset = source_group * max_private_tokens
+            + local_expert * num_max_dispatch_tokens_per_rank
+            + slot;
+        std::byte *dst_base = dst_rank == rank ? send_buffer : recv_ptrs[dst_rank % node_size];
+        std::byte *token_ptr = dst_base + rect_offset * token_stride;
         uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
-        float *x_scale_src = (float*)(x_scale_ptr + token * x_scale_stride_token);
+        uint4 *x_token_dst = (uint4*)token_ptr;
+        store_source_route_info(token_ptr, token, route, expert);
 
-        if constexpr (std::is_same_v<TokenDimTy, NotFixed>) {
-            for (unsigned i = threadIdx.x; i * sizeof(uint4) < token_dim_bound; i += NUM_THREADS) {
-                const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
-                uint4 val = ld_global_nc_uint4(&x_token_src[i]);
-                float scale_val;
-                if (has_scale) {
-                    scale_val = *(float*)(x_scale_src + i * x_scale_stride_elem);
-                }
+        const uint32_t token_int4 = token_dim / sizeof(uint4);
+        for (uint32_t i = lane_id; i < token_int4; i += WARP_SIZE) {
+            uint4 val = ld_global_nc_uint4(&x_token_src[i]);
+            st_global_nc_uint4(&x_token_dst[i], val);
+        }
 
-                for (uint32_t route = 0; route < num_experts_per_token_bound; ++route) {
-                    const uint32_t expert = __ldg(&indices[token * indices_stride + route]);
-                    const uint32_t dst_rank = expert / experts_per_rank;
-                    const uint32_t local_expert = expert - dst_rank * experts_per_rank;
-                    const uint32_t slot = token_offset[token * num_experts_per_token_bound + route];
-                    const uint32_t rect_offset = source_group * max_private_tokens
-                        + local_expert * num_max_dispatch_tokens_per_rank
-                        + slot;
-                    std::byte *dst_base = dst_rank == rank ? send_buffer : recv_ptrs[dst_rank % NODE_SIZE];
-                    std::byte *token_ptr = dst_base + rect_offset * token_stride;
-                    uint4 *x_token_dst = (uint4*)token_ptr;
-                    store_source_route_info(token_ptr, token, route, expert);
-                    st_global_nc_uint4(&x_token_dst[i], val);
-                    if (has_scale) {
-                        *((float*)(token_ptr + token_dim_bound) + i) = scale_val;
-                    }
-                }
-            }
-        } else {
-            constexpr size_t TOKEN_DIM = TokenDimTy::Value;
-            constexpr size_t NUM_STEPS = (TOKEN_DIM + NUM_THREADS - 1) / NUM_THREADS;
-            uint4 vals[NUM_STEPS];
-            float scales[NUM_STEPS];
-
-            #pragma unroll(NUM_STEPS)
-            for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
-                const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
-                vals[s] = ld_global_nc_uint4(&x_token_src[i]);
-                if (has_scale) {
-                    scales[s] = *(float*)(x_scale_src + i * x_scale_stride_elem);
-                }
-            }
-
-            for (uint32_t route = 0; route < num_experts_per_token_bound; ++route) {
-                const uint32_t expert = __ldg(&indices[token * indices_stride + route]);
-                const uint32_t dst_rank = expert / experts_per_rank;
-                const uint32_t local_expert = expert - dst_rank * experts_per_rank;
-                const uint32_t slot = token_offset[token * num_experts_per_token_bound + route];
-                const uint32_t rect_offset = source_group * max_private_tokens
-                    + local_expert * num_max_dispatch_tokens_per_rank
-                    + slot;
-                std::byte *dst_base = dst_rank == rank ? send_buffer : recv_ptrs[dst_rank % NODE_SIZE];
-                std::byte *token_ptr = dst_base + rect_offset * token_stride;
-                uint4 *x_token_dst = (uint4*)token_ptr;
-                store_source_route_info(token_ptr, token, route, expert);
-
-                #pragma unroll(NUM_STEPS)
-                for (unsigned i = threadIdx.x, s = 0; i * sizeof(uint4) < TOKEN_DIM; i += NUM_THREADS, s++) {
-                    const bool has_scale = x_scale_ptr && i < hidden_dim_scale_bound;
-                    st_global_nc_uint4(&x_token_dst[i], vals[s]);
-                    if (has_scale) {
-                        *((float*)(token_ptr + token_dim_bound) + i) = scales[s];
-                    }
-                }
+        if (x_scale_ptr) {
+            const float *x_scale_src = (const float*)(x_scale_ptr + token * x_scale_stride_token);
+            float *x_scale_dst = (float*)(token_ptr + token_dim);
+            for (uint32_t i = lane_id; i < hidden_dim_scale; i += WARP_SIZE) {
+                x_scale_dst[i] = *(float*)(x_scale_src + i * x_scale_stride_elem);
             }
         }
     }
 
     grid.sync();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        st_mmio_u32(dispatch_send_done, epoch);
+        st_mmio_u32(dispatch_send_done, *current_epoch);
     }
 
-    if constexpr (NODE_SIZE > 1) {
-        grid.sync();
-        if (blockIdx.x == 0) {
-            auto local_rank = rank % NODE_SIZE;
-            if (threadIdx.x < NODE_SIZE) {
-                st_release_u32(&sync_ptrs[threadIdx.x][local_rank + NODE_SIZE], counter + 1);
-            }
+    grid.sync();
+    if (blockIdx.x == 0) {
+        const uint32_t counter = *sync_counter;
+        auto local_rank = rank % node_size;
+        if (threadIdx.x < node_size) {
+            st_release_u32(&sync_ptrs[threadIdx.x][local_rank + node_size], counter);
         }
     }
 }
@@ -887,7 +890,37 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
         &current_epoch,
     };
 
-    nvtxRangePush("dispatch_send_node_rect");
+    void *copy_args[] = {
+        const_cast<size_t *>(&token_dim),
+        const_cast<size_t *>(&token_scale_dim),
+        const_cast<size_t *>(&token_stride),
+        &hidden_dim_scale,
+        &num_experts,
+        &num_experts_per_token,
+        &max_private_tokens,
+        &num_max_dispatch_tokens_per_rank,
+        &rank,
+        &node_size,
+        &world_size,
+        &num_tokens,
+        &bound_m_ptr,
+        &x_ptr,
+        &x_stride,
+        &x_scale_ptr,
+        &x_scale_stride_elem,
+        &x_scale_stride_token,
+        &indices,
+        &indices_stride,
+        &token_offset,
+        &dispatch_send_done,
+        &send_buffer,
+        &sync_counter,
+        &sync_ptrs,
+        &recv_ptrs,
+        &current_epoch,
+    };
+
+    nvtxRangePush("dispatch_send_node_rect_route");
     cudaError_t status;
     LAUNCH_WORLD_SIZE(node_size, NODE_SIZE, {
         LAUNCH_TOKEN_DIM_DISPATCH(token_dim, TokenDim, {
@@ -905,6 +938,20 @@ int a2a_kernels::a2a_dispatch_send_node_rect(
             });
         });
     });
+    nvtxRangePop();
+    if (status != cudaSuccess) {
+        return status;
+    }
+
+    nvtxRangePush("dispatch_send_node_rect_copy");
+    status = cudaLaunchCooperativeKernel(
+        (void *)&a2a_dispatch_send_node_rect_copy_kernel,
+        dimGrid,
+        dimBlock,
+        copy_args,
+        0,
+        (cudaStream_t)stream
+    );
     nvtxRangePop();
     return status;
 }
