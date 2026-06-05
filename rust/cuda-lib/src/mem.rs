@@ -104,6 +104,32 @@ impl CudaDeviceMemory {
     }
 }
 
+/// Copy from a raw CUDA device pointer into a host vector.
+///
+/// # Safety
+///
+/// `ptr` must point to at least `len * size_of::<T>()` readable bytes in CUDA
+/// device memory visible to the current process.
+pub unsafe fn device_ptr_to_vec<T: Copy + Default>(
+    ptr: *const T,
+    len: usize,
+) -> Result<Vec<T>, CudartError> {
+    let size = len * std::mem::size_of::<T>();
+    let mut data = vec![T::default(); len];
+    let ret = unsafe {
+        cudart_sys::cudaMemcpy(
+            data.as_mut_ptr() as *mut c_void,
+            ptr as *const c_void,
+            size,
+            cudart_sys::cudaMemcpyDeviceToHost,
+        )
+    };
+    if ret != cudart_sys::cudaSuccess {
+        return Err(CudartError::new(ret, "cudaMemcpyDeviceToHost"));
+    }
+    Ok(data)
+}
+
 impl Drop for CudaDeviceMemory {
     fn drop(&mut self) {
         unsafe { cudart_sys::cudaFree(self.ptr.as_ptr()) };

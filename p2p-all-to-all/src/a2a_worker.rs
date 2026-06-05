@@ -835,6 +835,16 @@ struct RoutingInfo {
     combine_ranges: Arc<Vec<ScatterTarget>>,
 }
 
+impl RoutingInfo {
+    fn empty() -> Self {
+        Self {
+            num_recv_tx: 0,
+            dispatch_ranges: Arc::new(Vec::new()),
+            combine_ranges: Arc::new(Vec::new()),
+        }
+    }
+}
+
 impl WorkerState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1147,7 +1157,7 @@ impl WorkerState {
         self.direct_node_dispatch.load(Ordering::Acquire)
     }
 
-    fn uses_single_node_rect_dispatch_protocol(&self) -> bool {
+    pub(crate) fn uses_single_node_rect_dispatch_protocol(&self) -> bool {
         if !self.node_rect_dispatch_protocol.load(Ordering::Acquire) {
             return false;
         }
@@ -1296,7 +1306,10 @@ impl WorkerState {
             );
         }
         let route_exchange_start = Instant::now();
-        if use_node_route_exchange {
+        if node_rect_dispatch_protocol {
+            // The single-node rectangular LL path publishes route counts into
+            // peer-visible CUDA workspace memory and derives layout on device.
+        } else if use_node_route_exchange {
             if !self.wait_node_route_counts(epoch) {
                 return;
             }
@@ -1307,7 +1320,11 @@ impl WorkerState {
         }
         Self::add_elapsed_ns(&self.accumulated_route_exchange_ns, route_exchange_start);
         let process_routing_start = Instant::now();
-        let route = self.process_routing_info(epoch);
+        let route = if node_rect_dispatch_protocol {
+            RoutingInfo::empty()
+        } else {
+            self.process_routing_info(epoch)
+        };
         Self::add_elapsed_ns(
             &self.accumulated_process_routing_ns,
             process_routing_start,

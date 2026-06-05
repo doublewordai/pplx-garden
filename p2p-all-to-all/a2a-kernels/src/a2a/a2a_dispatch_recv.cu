@@ -40,12 +40,15 @@ void a2a_dispatch_recv_kernel(
     std::byte * __restrict__ recv_buffer,
     uint32_t * __restrict__ source_rank,
     uint32_t * __restrict__ source_offset,
+    uint32_t * __restrict__ combine_send_offset,
     uint32_t * __restrict__ padded_index,
     uint32_t * __restrict__ source_rank_by_final_index,
     uint32_t * __restrict__ source_token_index,
     uint32_t * __restrict__ source_route_index,
     uint32_t * __restrict__ source_expert_index,
     uint32_t * __restrict__ num_routed,
+    uint32_t ** __restrict__ dispatch_source_counts_ptrs,
+    bool use_device_source_counts,
     uint32_t * __restrict__ num_recv_tokens_ptr,
     uint32_t * __restrict__ num_recv_tokens_ready,
     uint8_t * __restrict__ dispatch_recv_flag,
@@ -112,7 +115,7 @@ void a2a_dispatch_recv_kernel(
 
     // Wait for NVLink transfers to complete.
     auto counter = *sync_counter;
-    if (warp_id == 0) {
+    if (warp_id == 0 && !(use_rect_transport_recv && use_device_source_counts)) {
         if (elect_one_sync()) {
             while (ld_mmio_u32(num_recv_tokens_ready) != epoch);
         }
@@ -137,6 +140,35 @@ void a2a_dispatch_recv_kernel(
         const size_t groups_per_node = NODE_SIZE / dp_size;
         const size_t slots_per_source_group = num_local_experts * num_max_dispatch_tokens_per_rank;
         const size_t total_rect_slots = (world_size / dp_size) * slots_per_source_group;
+        const uint32_t *source_counts = use_device_source_counts
+            ? dispatch_source_counts_ptrs[rank % NODE_SIZE]
+            : num_routed;
+
+        if (use_device_source_counts && blockIdx.x == 0) {
+            for (uint32_t local_expert = threadIdx.x; local_expert < num_local_experts; local_expert += blockDim.x) {
+                const uint32_t expert = first_expert + local_expert;
+                uint32_t count = 0;
+                for (uint32_t source_group = 0; source_group < world_size; ++source_group) {
+                    count += __ldg(source_counts + source_group * num_experts + expert);
+                }
+                tokens_per_expert[local_expert] = count;
+                out_num_tokens_ptr[local_expert] = count;
+            }
+            if (threadIdx.x == 0) {
+                uint32_t total = 0;
+                for (uint32_t local_expert = 0; local_expert < num_local_experts; ++local_expert) {
+                    const uint32_t expert = first_expert + local_expert;
+                    for (uint32_t source_group = 0; source_group < world_size; ++source_group) {
+                        total += __ldg(source_counts + source_group * num_experts + expert);
+                    }
+                }
+                num_recv_tokens_ptr[0] = total;
+                num_recv_tokens_ptr[1] = 0;
+                num_recv_tokens_ptr[2] = 0;
+                st_mmio_u32(num_recv_tokens_ready, epoch);
+            }
+        }
+        grid.sync();
 
         for (size_t linear = blockIdx.x; linear < total_rect_slots; linear += gridDim.x) {
             const size_t source_group = linear / slots_per_source_group;
@@ -144,7 +176,7 @@ void a2a_dispatch_recv_kernel(
             const size_t local_expert = local_slot / num_max_dispatch_tokens_per_rank;
             const size_t token_in_source_expert = local_slot - local_expert * num_max_dispatch_tokens_per_rank;
             const size_t expert = first_expert + local_expert;
-            const uint32_t source_count = __ldg(num_routed + source_group * num_experts + expert);
+            const uint32_t source_count = __ldg(source_counts + source_group * num_experts + expert);
             if (token_in_source_expert >= source_count) {
                 continue;
             }
@@ -155,7 +187,35 @@ void a2a_dispatch_recv_kernel(
                 if (ordered_group == source_group) {
                     break;
                 }
-                source_group_offset += __ldg(num_routed + ordered_group * num_experts + expert);
+                source_group_offset += __ldg(source_counts + ordered_group * num_experts + expert);
+            }
+            uint32_t compact_index = 0;
+            if (source_group == dp_group) {
+                for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                    const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                    for (size_t prior_local_expert = 0; prior_local_expert < num_local_experts; ++prior_local_expert) {
+                        compact_index += __ldg(source_counts + ordered_group * num_experts + first_expert + prior_local_expert);
+                    }
+                }
+            } else {
+                for (size_t local_group_offset = 1; local_group_offset < groups_per_node; ++local_group_offset) {
+                    const size_t ordered_group = (dp_group + local_group_offset) % groups_per_node;
+                    if (ordered_group == source_group) {
+                        break;
+                    }
+                    for (size_t prior_local_expert = 0; prior_local_expert < num_local_experts; ++prior_local_expert) {
+                        compact_index += __ldg(source_counts + ordered_group * num_experts + first_expert + prior_local_expert);
+                    }
+                }
+            }
+            for (size_t prior_local_expert = 0; prior_local_expert < local_expert; ++prior_local_expert) {
+                compact_index += __ldg(source_counts + source_group * num_experts + first_expert + prior_local_expert);
+            }
+            compact_index += token_in_source_expert;
+
+            uint32_t source_expert_offset = 0;
+            for (uint32_t prior_expert = 0; prior_expert < expert; ++prior_expert) {
+                source_expert_offset += __ldg(source_counts + source_group * num_experts + prior_expert);
             }
             const uint32_t source_rank_value = source_group * dp_size + (rank % dp_size);
             const uint32_t dst_index = local_expert * max_tokens_per_expert
@@ -174,6 +234,10 @@ void a2a_dispatch_recv_kernel(
                 source_token_index[dst_index] = source_route_info[0];
                 source_route_index[dst_index] = source_route_info[1];
                 source_expert_index[dst_index] = source_route_info[2];
+                padded_index[compact_index] = dst_index;
+                source_rank[compact_index] = source_rank_value;
+                source_offset[compact_index] = src_index;
+                combine_send_offset[compact_index] = source_expert_offset + token_in_source_expert;
             }
 
             if (!skip_rect_payload_copy) {
@@ -193,7 +257,7 @@ void a2a_dispatch_recv_kernel(
             }
         }
 
-        if (blockIdx.x == 0) {
+        if (!use_device_source_counts && blockIdx.x == 0) {
             for (unsigned expert = threadIdx.x; expert < num_local_experts; expert += blockDim.x) {
                 out_num_tokens_ptr[expert] = tokens_per_expert[expert];
             }
@@ -393,12 +457,15 @@ int a2a_kernels::a2a_dispatch_recv(
     uint8_t *recv_buffer,
     uint32_t *source_rank,
     uint32_t *source_offset,
+    uint32_t *combine_send_offset,
     uint32_t *padded_index,
     uint32_t *source_rank_by_final_index,
     uint32_t *source_token_index,
     uint32_t *source_route_index,
     uint32_t *source_expert_index,
     uint32_t *num_routed,
+    uint32_t **dispatch_source_counts_ptrs,
+    bool use_device_source_counts,
     uint32_t *num_recv_tokens_ptr,
     uint32_t *num_recv_tokens_ready,
     uint8_t *dispatch_recv_flag,
@@ -446,12 +513,15 @@ int a2a_kernels::a2a_dispatch_recv(
         &recv_buffer,
         &source_rank,
         &source_offset,
+        &combine_send_offset,
         &padded_index,
         &source_rank_by_final_index,
         &source_token_index,
         &source_route_index,
         &source_expert_index,
         &num_routed,
+        &dispatch_source_counts_ptrs,
+        &use_device_source_counts,
         &num_recv_tokens_ptr,
         &num_recv_tokens_ready,
         &dispatch_recv_flag,

@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use cuda_lib::{
-    CudaDeviceMemory, cuda_check,
+    CudaDeviceMemory, cuda_check, device_ptr_to_vec,
     rt::{CudartError, cudaGetNumSMs, cudaSetDevice},
 };
 use fabric_lib::{TransferEngine, api::MemoryRegionHandle};
@@ -125,6 +125,8 @@ struct DeviceWorkspace {
     low_latency_expert_x_scale_ptrs: Option<CudaDeviceMemory>,
     /// Device-side low-latency per-expert count pointers.
     low_latency_expert_num_tokens_ptrs: Option<CudaDeviceMemory>,
+    /// Device-side low-latency source count-table pointers.
+    low_latency_dispatch_source_counts_ptrs: Option<CudaDeviceMemory>,
 }
 
 impl DeviceWorkspace {
@@ -208,6 +210,7 @@ impl DeviceWorkspace {
             low_latency_expert_x_ptrs: None,
             low_latency_expert_x_scale_ptrs: None,
             low_latency_expert_num_tokens_ptrs: None,
+            low_latency_dispatch_source_counts_ptrs: None,
         })
     }
 
@@ -242,6 +245,7 @@ impl DeviceWorkspace {
         expert_x_ptrs: &[u64],
         expert_x_scale_ptrs: Option<&[u64]>,
         expert_num_tokens_ptrs: &[u64],
+        dispatch_source_counts_ptrs: &[u64],
     ) -> Result<(), CudartError> {
         self.low_latency_expert_x_ptrs =
             Some(CudaDeviceMemory::from_vec(expert_x_ptrs)?);
@@ -251,6 +255,8 @@ impl DeviceWorkspace {
         };
         self.low_latency_expert_num_tokens_ptrs =
             Some(CudaDeviceMemory::from_vec(expert_num_tokens_ptrs)?);
+        self.low_latency_dispatch_source_counts_ptrs =
+            Some(CudaDeviceMemory::from_vec(dispatch_source_counts_ptrs)?);
         Ok(())
     }
 
@@ -271,6 +277,32 @@ impl DeviceWorkspace {
         self.low_latency_expert_num_tokens_ptrs
             .as_mut()
             .map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    fn get_low_latency_dispatch_source_counts_ptr(&mut self) -> *mut *mut u32 {
+        self.low_latency_dispatch_source_counts_ptrs
+            .as_mut()
+            .map_or(null_mut(), |p| p.get_mut_ptr())
+    }
+
+    fn debug_low_latency_dispatch_source_counts(
+        &self,
+        local_rank: usize,
+        len: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        let Some(ptrs) = &self.low_latency_dispatch_source_counts_ptrs else {
+            return Ok(None);
+        };
+        let ptr_values = ptrs
+            .to_vec::<u64>(local_rank + 1)
+            .map_err(|e| anyhow!("copy low-latency dispatch count pointers: {e}"))?;
+        let ptr = ptr_values[local_rank] as *const u32;
+        if ptr.is_null() {
+            return Ok(None);
+        }
+        let counts = unsafe { device_ptr_to_vec(ptr, len) }
+            .map_err(|e| anyhow!("copy low-latency dispatch source counts: {e}"))?;
+        Ok(Some(counts))
     }
 }
 
@@ -623,6 +655,8 @@ impl AllToAllContext {
         let expert_x_ptrs = self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_x")?;
         let expert_num_tokens_ptrs =
             self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_num_tokens")?;
+        let dispatch_source_counts_ptrs =
+            self.low_latency_tensor_ptrs(&tensor_ptrs, "dispatch_source_counts")?;
         let expert_x_scale_ptrs = if self.scale_elemsize > 0 {
             Some(self.low_latency_tensor_ptrs(&tensor_ptrs, "expert_x_scale")?)
         } else {
@@ -634,6 +668,7 @@ impl AllToAllContext {
                 &expert_x_ptrs[slot],
                 expert_x_scale_ptrs.as_ref().map(|ptrs| ptrs[slot].as_slice()),
                 &expert_num_tokens_ptrs[slot],
+                &dispatch_source_counts_ptrs[slot],
             )?;
         }
         Ok(())
@@ -944,6 +979,8 @@ impl AllToAllContext {
         let low_latency_expert_x_ptrs = workspace.get_low_latency_expert_x_ptr() as *mut *mut u8;
         let low_latency_expert_x_scale_ptrs =
             workspace.get_low_latency_expert_x_scale_ptr() as *mut *mut u8;
+        let low_latency_dispatch_source_counts_ptrs =
+            workspace.get_low_latency_dispatch_source_counts_ptr();
 
         if trace {
             eprintln!(
@@ -1008,6 +1045,7 @@ impl AllToAllContext {
                 } else {
                     std::ptr::null_mut()
                 },
+                low_latency_dispatch_source_counts_ptrs,
                 worker.slot.num_recv_tokens_ready.get_device_ptr(),
                 workspace.epoch_counter.get_mut_ptr(),
                 workspace.current_epoch.get_mut_ptr(),
@@ -1153,6 +1191,7 @@ impl AllToAllContext {
         let worker = self.worker(slot)?.clone();
         let workspace = self.workspace_mut(slot)?;
         let skip_rect_payload_copy = worker.direct_node_dispatch_enabled();
+        let use_device_source_counts = worker.uses_single_node_rect_dispatch_protocol();
 
         cuda_check!(a2a_kernels::a2a_dispatch_recv(
             num_blocks,
@@ -1178,12 +1217,15 @@ impl AllToAllContext {
             worker.buffers.recv_buffer_ptr as *mut u8,
             worker.slot.source_rank.get_device_ptr(),
             worker.slot.source_dispatch_offset.get_device_ptr(),
+            worker.slot.combine_send_offset.get_device_ptr(),
             worker.slot.padded_index.get_device_ptr(),
             workspace.source_rank_by_final_index.get_mut_ptr(),
             workspace.source_token_index.get_mut_ptr(),
             workspace.source_route_index.get_mut_ptr(),
             workspace.source_expert_index.get_mut_ptr(),
             worker.buffers.num_routed_ptr,
+            workspace.get_low_latency_dispatch_source_counts_ptr(),
+            use_device_source_counts,
             worker.slot.num_recv_tokens.get_device_ptr(),
             worker.slot.num_recv_tokens_ready.get_device_ptr(),
             worker.slot.dispatch_recv_flag.get_device_ptr(),
@@ -1410,6 +1452,14 @@ impl AllToAllContext {
         add_workspace_tensor(
             &mut tensors,
             &mut total_bytes,
+            "dispatch_source_counts",
+            vec![num_ep_groups, self.num_experts],
+            "uint32",
+            ScalarType::U32.element_size(),
+        );
+        add_workspace_tensor(
+            &mut tensors,
+            &mut total_bytes,
             "expert_x",
             vec![num_local_experts, self.max_tokens_per_expert, self.hidden_dim],
             "activation",
@@ -1599,6 +1649,15 @@ impl AllToAllContext {
         let num_ep_groups = self.world_size / self.dp_size;
         let dp_group = self.rank / self.dp_size;
         let dp_rank = self.rank % self.dp_size;
+        let workspace = self.workspace(slot)?;
+        let device_source_counts = if worker.uses_single_node_rect_dispatch_protocol() {
+            workspace.debug_low_latency_dispatch_source_counts(
+                self.rank % self.node_size,
+                num_ep_groups * self.num_experts,
+            )?
+        } else {
+            None
+        };
         let mut plan = compute_low_latency_route_layout_plan(
             dp_group,
             dp_rank,
@@ -1612,19 +1671,25 @@ impl AllToAllContext {
             1,
             |source_group, expert| {
                 debug_assert!(source_group < num_ep_groups);
-                worker.get_num_routed(source_group, expert)
+                device_source_counts
+                    .as_ref()
+                    .map_or_else(
+                        || worker.get_num_routed(source_group, expert),
+                        |counts| counts[source_group * self.num_experts + expert],
+                    )
             },
         );
-        plan.layout_range = (0..plan.layout_range.len())
-            .map(|index| worker.slot.layout_range.get(index))
-            .collect();
+        if device_source_counts.is_none() {
+            plan.layout_range = (0..plan.layout_range.len())
+                .map(|index| worker.slot.layout_range.get(index))
+                .collect();
+        }
         plan.source_group_expert_offsets =
             source_group_expert_offsets_from_layout_range(
                 &plan.layout_range,
                 num_ep_groups,
                 self.num_experts.div_ceil(num_ep_groups),
             );
-        let workspace = self.workspace(slot)?;
         let max_final_slots = if self.max_tokens_per_expert > 0 {
             self.num_experts.div_ceil(num_ep_groups) * self.max_tokens_per_expert
         } else {
