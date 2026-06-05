@@ -824,6 +824,7 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         direct_to_low_latency_workspace: bool,
+        use_low_latency_rect_transport: bool,
         stream: u64,
     ) -> Result<DispatchHandleState> {
         if num_tokens > self.max_num_tokens {
@@ -844,6 +845,7 @@ impl AllToAllContext {
             weights_stride,
             bound_m_ptr,
             direct_to_low_latency_workspace,
+            use_low_latency_rect_transport,
             stream,
         )?;
         self.begin_dispatch_handle(slot, num_tokens)
@@ -865,6 +867,7 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         direct_to_low_latency_workspace: bool,
+        use_low_latency_rect_transport: bool,
         stream: u64,
     ) -> Result<DispatchHandleState> {
         if num_tokens > self.max_num_tokens {
@@ -889,6 +892,7 @@ impl AllToAllContext {
             weights_stride,
             bound_m_ptr,
             direct_to_low_latency_workspace,
+            use_low_latency_rect_transport,
             stream,
         )?;
         self.begin_dispatch_handle(slot, num_tokens)
@@ -910,6 +914,7 @@ impl AllToAllContext {
         weights_stride: usize,
         bound_m_ptr: *const i32,
         direct_to_low_latency_workspace: bool,
+        use_low_latency_rect_transport: bool,
         stream: u64,
     ) -> Result<()> {
         if num_tokens > self.max_num_tokens {
@@ -950,12 +955,14 @@ impl AllToAllContext {
         let num_local_experts = num_experts.div_ceil(world_size / dp_size);
         let use_node_rect_send = dp_size == 1
             && world_size == node_size
-            && direct_to_low_latency_workspace
+            && (direct_to_low_latency_workspace || use_low_latency_rect_transport)
             && num_max_dispatch_tokens_per_rank > 0
             && num_local_experts * num_max_dispatch_tokens_per_rank
                 <= max_private_tokens
             && !low_latency_expert_x_ptrs.is_null();
-        worker.set_direct_node_dispatch(use_node_rect_send);
+        let use_direct_node_dispatch = use_node_rect_send && direct_to_low_latency_workspace;
+        worker.set_node_rect_dispatch_protocol(use_node_rect_send);
+        worker.set_direct_node_dispatch(use_direct_node_dispatch);
 
         if use_node_rect_send {
             cuda_check!(a2a_kernels::a2a_dispatch_send_node_rect(
@@ -991,8 +998,16 @@ impl AllToAllContext {
                 workspace.sync_counter.get_mut_ptr(),
                 workspace.get_sync_ptr(),
                 workspace.get_recv_ptr() as *mut *mut u8,
-                low_latency_expert_x_ptrs,
-                low_latency_expert_x_scale_ptrs,
+                if use_direct_node_dispatch {
+                    low_latency_expert_x_ptrs
+                } else {
+                    std::ptr::null_mut()
+                },
+                if use_direct_node_dispatch {
+                    low_latency_expert_x_scale_ptrs
+                } else {
+                    std::ptr::null_mut()
+                },
                 worker.slot.num_recv_tokens_ready.get_device_ptr(),
                 workspace.epoch_counter.get_mut_ptr(),
                 workspace.current_epoch.get_mut_ptr(),

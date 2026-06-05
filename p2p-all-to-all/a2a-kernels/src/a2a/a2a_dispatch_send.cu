@@ -789,7 +789,9 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
         }
         const uint32_t max_tokens_per_expert = num_max_dispatch_tokens_per_rank * world_size;
         const uint32_t final_index = local_expert * max_tokens_per_expert + source_group_offset + slot;
-        std::byte *token_ptr = expert_x_ptrs[dst_rank % node_size] + final_index * token_dim;
+        std::byte *token_ptr = expert_x_ptrs
+            ? expert_x_ptrs[dst_rank % node_size] + final_index * token_dim
+            : meta_token_ptr;
         uint4 *x_token_src = (uint4*)(x_ptr + token * x_stride);
         uint4 *x_token_dst = (uint4*)token_ptr;
         store_source_route_info(meta_token_ptr, token, route, expert);
@@ -800,10 +802,12 @@ __global__ __launch_bounds__(16 * WARP_SIZE, 1) void a2a_dispatch_send_node_rect
             st_global_nc_uint4(&x_token_dst[i], val);
         }
 
-        if (x_scale_ptr && expert_x_scale_ptrs) {
+        if (x_scale_ptr) {
             const float *x_scale_src = x_scale_ptr + token * x_scale_stride_token;
-            float *x_scale_dst = (float*)(expert_x_scale_ptrs[dst_rank % node_size]
-                + final_index * hidden_dim_scale * sizeof(float));
+            float *x_scale_dst = expert_x_scale_ptrs
+                ? (float*)(expert_x_scale_ptrs[dst_rank % node_size]
+                    + final_index * hidden_dim_scale * sizeof(float))
+                : (float*)(meta_token_ptr + token_dim);
             for (uint32_t i = lane_id; i < hidden_dim_scale; i += WARP_SIZE) {
                 x_scale_dst[i] = *(float*)(x_scale_src + i * x_scale_stride_elem);
             }

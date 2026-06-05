@@ -945,6 +945,7 @@ class P2PAllToAll(AllToAllKernel):
         _slot: Optional[int] = None,
         _generation: Optional[int] = None,
         _direct_to_low_latency_workspace: bool = False,
+        _use_low_latency_rect_transport: bool = False,
     ) -> None:
         assert self._all_to_all is not None
         assert do_send or do_recv
@@ -1066,6 +1067,9 @@ class P2PAllToAll(AllToAllKernel):
                     direct_to_low_latency_workspace=(
                         _direct_to_low_latency_workspace
                     ),
+                    use_low_latency_rect_transport=(
+                        _use_low_latency_rect_transport
+                    ),
                     stream=stream,
                 )
                 _slot = int(native_handle["slot"])
@@ -1086,6 +1090,9 @@ class P2PAllToAll(AllToAllKernel):
                     bound_m_ptr=bound_m_ptr,
                     direct_to_low_latency_workspace=(
                         _direct_to_low_latency_workspace
+                    ),
+                    use_low_latency_rect_transport=(
+                        _use_low_latency_rect_transport
                     ),
                     stream=stream,
                 )
@@ -1152,6 +1159,7 @@ class P2PAllToAll(AllToAllKernel):
         bound_m: Optional[torch.Tensor] = None,
         slot: Optional[int] = None,
         _direct_to_low_latency_workspace: bool = False,
+        _use_low_latency_rect_transport: bool = False,
     ) -> P2PDispatchHandle:
         self.dispatch(
             out_expert_num_tokens=out_expert_num_tokens,
@@ -1166,6 +1174,7 @@ class P2PAllToAll(AllToAllKernel):
             do_recv=False,
             _slot=slot,
             _direct_to_low_latency_workspace=_direct_to_low_latency_workspace,
+            _use_low_latency_rect_transport=_use_low_latency_rect_transport,
         )
         assert self._sync_slot is not None
         assert self._sync_generation is not None
@@ -1319,6 +1328,7 @@ class P2PAllToAll(AllToAllKernel):
                 bound_m=bound_m,
                 slot=slot_key,
                 _direct_to_low_latency_workspace=False,
+                _use_low_latency_rect_transport=True,
             )
             handle.workspace_lease = lease
         except Exception:

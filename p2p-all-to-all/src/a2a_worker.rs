@@ -798,6 +798,7 @@ pub(crate) struct WorkerState {
     combine_counter: ImmCounter,
     dispatch_barrier_counter: ImmCounter,
     combine_barrier_counter: ImmCounter,
+    node_rect_dispatch_protocol: AtomicBool,
     direct_node_dispatch: AtomicBool,
     tx_counter: Arc<AtomicI64>,
     err_counter: Arc<AtomicI64>,
@@ -997,6 +998,7 @@ impl WorkerState {
             combine_counter,
             dispatch_barrier_counter,
             combine_barrier_counter,
+            node_rect_dispatch_protocol: AtomicBool::new(false),
             direct_node_dispatch: AtomicBool::new(false),
             tx_counter: Arc::new(AtomicI64::new(0)),
             err_counter: Arc::new(AtomicI64::new(0)),
@@ -1136,12 +1138,17 @@ impl WorkerState {
         self.direct_node_dispatch.store(enabled, Ordering::Release);
     }
 
+    pub(crate) fn set_node_rect_dispatch_protocol(&self, enabled: bool) {
+        self.node_rect_dispatch_protocol
+            .store(enabled, Ordering::Release);
+    }
+
     pub(crate) fn direct_node_dispatch_enabled(&self) -> bool {
         self.direct_node_dispatch.load(Ordering::Acquire)
     }
 
-    fn uses_single_node_direct_dispatch(&self) -> bool {
-        if !self.direct_node_dispatch_enabled() {
+    fn uses_single_node_rect_dispatch_protocol(&self) -> bool {
+        if !self.node_rect_dispatch_protocol.load(Ordering::Acquire) {
             return false;
         }
         let num_ep_groups = self.world_size / self.dp_size;
@@ -1231,9 +1238,9 @@ impl WorkerState {
                 .unwrap();
         }
 
-        let direct_node_dispatch = self.uses_single_node_direct_dispatch();
+        let node_rect_dispatch_protocol = self.uses_single_node_rect_dispatch_protocol();
 
-        if !direct_node_dispatch {
+        if !node_rect_dispatch_protocol {
             // Wait for the dispatch kernel to copy tokens into send buffers
             // before fabric payload transfers consume those buffers.
             let wait_dispatch_send_start = Instant::now();
@@ -1262,7 +1269,7 @@ impl WorkerState {
         }
 
         // Trigger transfers into private recv buffers.
-        let num_private_ranges = if direct_node_dispatch {
+        let num_private_ranges = if node_rect_dispatch_protocol {
             0
         } else {
             self.dispatch_initial_routes()
@@ -1317,11 +1324,10 @@ impl WorkerState {
             );
         }
 
-        if direct_node_dispatch {
+        if node_rect_dispatch_protocol {
             // The direct single-node path needs destination-side route layout
-            // before it writes into final BatchedExperts storage. The copy
-            // kernel waits on num_recv_tokens_ready, then publishes
-            // dispatch_send_done.
+            // before it performs the payload copy. The copy kernel waits on
+            // num_recv_tokens_ready, then publishes dispatch_send_done.
             let wait_dispatch_send_start = Instant::now();
             if !self.wait_epoch_trace(
                 "dispatch_send_done",
