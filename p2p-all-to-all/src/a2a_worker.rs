@@ -76,6 +76,7 @@ pub struct LowLatencyRouteLayoutPlan {
     pub source_rank_by_final_index: Vec<u32>,
     pub source_token_index: Vec<u32>,
     pub source_route_index: Vec<u32>,
+    pub source_expert_index: Vec<u32>,
     pub tokens_per_source_group_per_local_expert: Vec<Vec<u32>>,
     pub source_group_expert_offsets: Vec<Vec<u32>>,
     pub tokens_per_expert: Vec<u32>,
@@ -503,6 +504,7 @@ pub(crate) fn compute_low_latency_route_layout_plan(
         source_rank_by_final_index: Vec::new(),
         source_token_index: Vec::new(),
         source_route_index: Vec::new(),
+        source_expert_index: Vec::new(),
         tokens_per_source_group_per_local_expert,
         source_group_expert_offsets,
         tokens_per_expert: plan.tokens_per_expert,
@@ -681,6 +683,7 @@ pub(crate) struct MicrobatchSlot {
     pub(crate) source_rank_by_final_index: GdrVec<u32>,
     pub(crate) source_token_index: GdrVec<u32>,
     pub(crate) source_route_index: GdrVec<u32>,
+    pub(crate) source_expert_index: GdrVec<u32>,
     pub(crate) layout_range: GdrVec<u64>,
     pub(crate) num_recv_tokens: GdrVec<u32>,
     pub(crate) num_recv_tokens_ready: GdrEpoch,
@@ -715,6 +718,7 @@ impl MicrobatchSlot {
         let source_rank_by_final_index = GdrVec::new(gdr_context, max_final_slots)?;
         let source_token_index = GdrVec::new(gdr_context, max_final_slots)?;
         let source_route_index = GdrVec::new(gdr_context, max_final_slots)?;
+        let source_expert_index = GdrVec::new(gdr_context, max_final_slots)?;
         let layout_range = GdrVec::new(gdr_context, num_local_experts * num_ep_groups)?;
         let num_recv_tokens = GdrVec::new(gdr_context, 3)?;
 
@@ -743,6 +747,7 @@ impl MicrobatchSlot {
             source_rank_by_final_index,
             source_token_index,
             source_route_index,
+            source_expert_index,
             layout_range,
             num_recv_tokens,
             num_recv_tokens_ready,

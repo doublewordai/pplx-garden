@@ -75,6 +75,7 @@ def expected_canonical_batched_experts_route_plan(
     source_rank_by_final_index: list[int] = []
     source_token_index: list[int] = []
     source_route_index: list[int] = []
+    source_expert_index: list[int] = []
     tokens_per_expert = [0 for _ in range(num_local_experts)]
     num_source_groups = len(rank_data)
     layout_range = [0 for _ in range(num_local_experts * num_source_groups)]
@@ -110,6 +111,7 @@ def expected_canonical_batched_experts_route_plan(
                     source_rank_by_final_index.append(route_source_rank)
                     source_token_index.append(token_idx)
                     source_route_index.append(topk_idx)
+                    source_expert_index.append(expert)
                     tokens_per_expert[local_expert] += 1
 
     return {
@@ -120,6 +122,7 @@ def expected_canonical_batched_experts_route_plan(
         "source_rank_by_final_index": source_rank_by_final_index,
         "source_token_index": source_token_index,
         "source_route_index": source_route_index,
+        "source_expert_index": source_expert_index,
         "tokens_per_source_group_per_local_expert": (
             tokens_per_source_group_per_local_expert
         ),
@@ -356,20 +359,24 @@ def expected_combine_from_route_metadata(
     source_ranks = cast(list[int], route_plan["source_rank_by_final_index"])
     source_tokens = cast(list[int], route_plan["source_token_index"])
     source_routes = cast(list[int], route_plan["source_route_index"])
+    source_experts = cast(list[int], route_plan["source_expert_index"])
 
     assert len(final_indices) == len(source_ranks)
     assert len(final_indices) == len(source_tokens)
     assert len(final_indices) == len(source_routes)
+    assert len(final_indices) == len(source_experts)
 
-    for final_index, source_rank, token_index, route_index in zip(
+    for final_index, source_rank, token_index, route_index, expert_index in zip(
         final_indices,
         source_ranks,
         source_tokens,
         source_routes,
+        source_experts,
     ):
         if source_rank != rank:
             continue
 
+        assert int(source.indices[token_index, route_index].item()) == expert_index
         weight = source.weights[token_index, route_index].to(torch.float32)
         result[token_index] += flat_expert_y[final_index] * weight
 

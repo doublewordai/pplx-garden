@@ -1061,6 +1061,7 @@ impl AllToAllContext {
             worker.slot.source_rank_by_final_index.get_device_ptr(),
             worker.slot.source_token_index.get_device_ptr(),
             worker.slot.source_route_index.get_device_ptr(),
+            worker.slot.source_expert_index.get_device_ptr(),
             worker.buffers.num_routed_ptr,
             worker.slot.num_recv_tokens.get_device_ptr(),
             worker.slot.num_recv_tokens_ready.get_device_ptr(),
@@ -1515,6 +1516,11 @@ impl AllToAllContext {
             .final_index
             .iter()
             .map(|index| worker.slot.source_route_index.get(*index as usize))
+            .collect();
+        plan.source_expert_index = plan
+            .final_index
+            .iter()
+            .map(|index| worker.slot.source_expert_index.get(*index as usize))
             .collect();
         Ok(plan)
     }
